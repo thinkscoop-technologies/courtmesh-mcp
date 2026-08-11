@@ -234,9 +234,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       description:
         "Fetches full details for one case, without AI analysis. No AI credits consumed. Returns id, caseNumber, " +
         "title, court, caseType, judges, petitioners, respondents, decisionDate, disposalNature, summary, " +
-        "optional metadata.diaryNumber, hasDocuments, documentCount and hasAnalysis. Text fields carry an " +
-        "invisible watermark. Fields like detailedSummary, headnote, holding and keyFacts are NOT included here, " +
-        "call get_case_analysis for those.",
+        "optional metadata.diaryNumber, hasDocuments, documentCount and hasAnalysis. Fields like " +
+        "detailedSummary, headnote, holding and keyFacts are NOT included here, call get_case_analysis " +
+        "for those.",
       inputSchema: { id: idParam },
     },
     async (args): Promise<CallToolResult> => {
