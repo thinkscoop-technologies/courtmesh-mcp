@@ -59,8 +59,16 @@ This server supports two transports, chosen at startup:
 | `screen_party_litigation` | `POST /party/screen` | Yes | Litigation check for a person or company name: KYC, BGV, due diligence, and litigation/compliance screening. |
 | `get_court_coverage` | `GET /coverage` | No | Corpus coverage and freshness snapshot, no authentication required. |
 | `check_api_health` | `GET /health` | No | Checks CourtMesh API connectivity, no authentication required. |
+| `get_api_usage` | `GET /usage` | No | This key's tier, wallet balance, per period limits and per endpoint call volume for the current month. |
+| `list_reference_courts` | `GET /reference/courts` | No | The court taxonomy accepted by `court` filters elsewhere, no authentication required. |
+| `list_reference_case_types` | `GET /reference/case-types` | No | Every `caseType` value accepted elsewhere, no authentication required. |
+| `screen_party_litigation_batch` | `POST /party/screen/batch` | Yes | Screens up to 25 names in one call, same check as `screen_party_litigation`; each item independently priced and independently able to fail. Not available on the Free tier, no adjudicate option. |
 
-Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+18 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+
+### Idempotency
+
+`analyze_case`, `analyze_consolidated_case`, `request_case_timeline`, `screen_party_litigation` and `screen_party_litigation_batch` each send an `Idempotency-Key` header automatically, derived as a SHA-256 hash of the tool name plus its exact arguments (see `computeIdempotencyKey` in `src/tools.ts`). If a model retries one of these calls with identical arguments, whether because of its own retry logic, a dropped connection, or a re-sent turn, the server recognises the replay (same key, same body) and returns the stored response again instead of re-running the job or re-charging credits. Changing even one argument produces a different key and runs as a brand new, separately charged call. This requires no configuration and needs no argument from the calling model.
 
 ## Configuration examples
 

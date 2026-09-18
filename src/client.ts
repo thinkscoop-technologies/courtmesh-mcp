@@ -58,6 +58,20 @@ export interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
   timeoutMs?: number;
+  /**
+   * Sent as the `Idempotency-Key` header when present. 1 to 128 characters,
+   * `[A-Za-z0-9_.-]`, scoped per API key for 24 hours: a replayed call with
+   * the same key and the same body returns the stored 2xx response again
+   * (no new charge), the same key with a different body is refused with
+   * HTTP 409 `IDEMPOTENCY_KEY_REUSED`. Only meaningful on
+   * `POST /party/screen`, `POST /party/screen/batch`,
+   * `POST /cases/{id}/analyze`, `POST /cases/{id}/analyze-consolidated`
+   * and `POST /request-timeline` - see `computeIdempotencyKey` in
+   * `tools.ts`, which derives this deterministically from the tool name
+   * and arguments so a model retrying an identical call never double
+   * charges or double runs a job.
+   */
+  idempotencyKey?: string;
 }
 
 /**
@@ -279,6 +293,7 @@ interface RawAttempt {
   parsed: any;
   jsonParseFailed: boolean;
   retryAfterHeader: string | null;
+  requestIdHeader: string | null;
 }
 
 /**
@@ -294,7 +309,7 @@ interface RawAttempt {
  * ever retried.
  */
 export async function request<T = any>(options: ClientOptions & RequestOptions): Promise<T> {
-  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs } = options;
+  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs, idempotencyKey } = options;
   const effectiveKey = apiKeyOverride ?? apiKey;
   const url = buildUrl(baseUrl, path, query);
   const timeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -308,6 +323,9 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
     }
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
+    }
+    if (idempotencyKey) {
+      headers["Idempotency-Key"] = idempotencyKey;
     }
 
     const controller = new AbortController();
@@ -349,7 +367,13 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
       }
     }
 
-    return { status: response.status, parsed, jsonParseFailed, retryAfterHeader: response.headers.get("retry-after") };
+    return {
+      status: response.status,
+      parsed,
+      jsonParseFailed,
+      retryAfterHeader: response.headers.get("retry-after"),
+      requestIdHeader: response.headers.get("x-request-id"),
+    };
   };
 
   let result = await attempt();
@@ -373,15 +397,18 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
     result = await attempt();
   }
 
-  const { status, parsed, jsonParseFailed } = result;
+  const { status, parsed, jsonParseFailed, requestIdHeader } = result;
 
   const errorMessage = classifyError(status, parsed);
   if (errorMessage) {
-    // Forward compatible: no endpoint documents a requestId in its error body today, but
-    // once one does (a concurrent workstream is adding X-Request-Id/request tracing), a
-    // caller reporting a problem to CourtMesh support needs this printed, not silently
-    // dropped because this client was written before the field existed.
-    const requestId = typeof parsed?.requestId === "string" && parsed.requestId.length > 0 ? parsed.requestId : undefined;
+    // Every response carries X-Request-Id (server/middleware/api-request-id.ts); an error
+    // body that already echoes it in its own "requestId" field wins (older server builds
+    // that pre-date the header can still carry a body-level requestId on some codes), the
+    // response header is the fallback so a caller reporting a problem to CourtMesh support
+    // always has something to quote either way.
+    const requestId =
+      (typeof parsed?.requestId === "string" && parsed.requestId.length > 0 ? parsed.requestId : undefined) ??
+      (requestIdHeader && requestIdHeader.length > 0 ? requestIdHeader : undefined);
     throw new CourtMeshApiError(requestId ? `${errorMessage} Request id: ${requestId}.` : errorMessage);
   }
 

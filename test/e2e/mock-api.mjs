@@ -5,7 +5,7 @@
  * ../../../research/server/public-api/openapi.ts).
  *
  * Serves /api/v1/prod/* on a random loopback port with realistic response shapes for
- * all 14 documented endpoints, plus scripted error modes.
+ * all 18 documented endpoints, plus scripted error modes.
  *
  * Scenario selection
  * -------------------
@@ -446,7 +446,7 @@ export async function startMockApi() {
       ? headerScenario.toLowerCase()
       : KEY_SCENARIO_MAP[key] || null;
 
-    const noAuthRequired = pathname === "/health" || pathname === "/coverage";
+    const noAuthRequired = pathname === "/health" || pathname === "/coverage" || pathname === "/reference/courts" || pathname === "/reference/case-types";
 
     // Scenario overrides apply before the normal auth/routing logic, exactly like a real
     // outage or quota gate would: they are not conditional on the request otherwise being
@@ -937,6 +937,164 @@ function route(pathname, method, url, body, res, ctx) {
           "own record under CourtMesh's case removal policy; see casePageUrl for the public case page.",
       },
       meta: { creditsCharged, adjudicated: adjudicate, corpusAsOf, responseTime: "1840ms" },
+    });
+    return;
+  }
+
+  // GET /usage
+  if (pathname === "/usage" && method === "GET") {
+    json(res, 200, {
+      success: true,
+      data: {
+        tier: "payg",
+        walletOwner: { type: "user", id: "mock-user-1" },
+        balance: { total: 4820, monthlyGrant: 0, signupGrant: 1000, purchased: 4000 },
+        limits: {
+          requestsPerMinute: 60,
+          requestsPerDay: 5000,
+          requestsPerMonth: 100_000,
+          maxPageSize: 50,
+          maxPaginationDepth: 500,
+          distinctCaseFetchesPerDay: 200,
+          pdfCallsPerMonth: 200,
+          aiCallsPerMonth: 100,
+          concurrentAnalyzeJobs: 2,
+          apiKeys: 5,
+          semanticSearchAllowed: true,
+          liveFetchAllowed: true,
+          liveFetchesPerDay: 20,
+          analysisReadAllowed: true,
+          partyScreensPerMonth: 100,
+        },
+        period: { start: "2026-09-01T00:00:00.000+05:30", end: "2026-09-30T23:59:59.999+05:30", key: "2026-09" },
+        creditsUsedThisPeriod: 340,
+        byEndpoint: [
+          { endpoint: "/api/v1/prod/search/cases", calls: 12, credits: 12 },
+          { endpoint: "/api/v1/prod/party/screen", calls: 2, credits: 220 },
+        ],
+        subscriptionRenewsAt: null,
+      },
+      meta: { requestId: randomUUID() },
+    });
+    return;
+  }
+
+  // GET /reference/courts
+  if (pathname === "/reference/courts" && method === "GET") {
+    json(res, 200, {
+      success: true,
+      data: {
+        courtTypes: ["Supreme Court", "High Court", "District Court", "Tribunal"],
+        courtsByType: {
+          "Supreme Court": ["Supreme Court of India"],
+          "High Court": ["Delhi High Court", "Bombay High Court"],
+          "District Court": ["District Court"],
+          Tribunal: ["National Company Law Tribunal"],
+        },
+        courtNamesByCourt: {
+          "Supreme Court of India": ["Supreme Court of India"],
+          "Delhi High Court": ["High Court of Delhi"],
+          "Bombay High Court": ["High Court of Judicature at Bombay"],
+        },
+      },
+    });
+    return;
+  }
+
+  // GET /reference/case-types
+  if (pathname === "/reference/case-types" && method === "GET") {
+    json(res, 200, {
+      success: true,
+      data: [
+        { code: "CRL.A.", fullForm: "Criminal Appeal", primaryType: "Criminal", nature: "Appellate" },
+        { code: "WP(C)", fullForm: "Writ Petition (Civil)", primaryType: "Civil", nature: "Original" },
+      ],
+    });
+    return;
+  }
+
+  // POST /party/screen/batch
+  if (pathname === "/party/screen/batch" && method === "POST") {
+    const items = Array.isArray(body?.items) ? body.items : [];
+    if (items.length === 0 || items.length > 25 || !body?.purpose) {
+      json(res, 400, {
+        success: false,
+        error: "Validation failed. Please check your request and try again.",
+        details: ["items: Must contain between 1 and 25 items.", "purpose: Required."],
+      });
+      return;
+    }
+    let matchesFound = 0;
+    let noMatches = 0;
+    let errors = 0;
+    const results = items.map((item, index) => {
+      // "FORCE_ERROR" is a mock-only marker (not a real API rule) simulating one item
+      // independently failing without failing the rest of the batch. A real per item
+      // failure would be, for example, a name that fails the server's own 2..200
+      // character validation - not reproducible here since the MCP tool's own zod
+      // schema already enforces that length client side before a request is ever sent.
+      if (typeof item?.name !== "string" || item.name.trim().length < 2 || item.name === "FORCE_ERROR") {
+        errors += 1;
+        return {
+          clientRef: item?.clientRef,
+          index,
+          ok: false,
+          error: { code: "VALIDATION_ERROR", message: "name must be 2..200 characters" },
+        };
+      }
+      const entityType = item.entityType || body.entityType || "person";
+      const band = entityType === "person" ? "probable" : "confirmed";
+      const found = index % 2 === 0;
+      if (found) matchesFound += 1;
+      else noMatches += 1;
+      return {
+        clientRef: item.clientRef,
+        index,
+        ok: true,
+        screen: {
+          query: { name: item.name, aliases: item.aliases || [], entityType, purpose: body.purpose, limit: item.limit || 40, displayThreshold: item.displayThreshold ?? 0.6 },
+          summary: {
+            matchCount: found ? 1 : 0,
+            byBand: { confirmed: found && band === "confirmed" ? 1 : 0, probable: found && band === "probable" ? 1 : 0, possible: 0, unlikely: 0 },
+            highestBand: found ? band : null,
+            verdict: found ? "matches_found" : "no_matches_found",
+          },
+          matches: found
+            ? [
+                {
+                  caseId: CASE_PENDING.id,
+                  title: CASE_PENDING.title,
+                  court: CASE_PENDING.court,
+                  caseNumber: CASE_PENDING.caseNumber,
+                  partyRole: "respondent",
+                  confidence: { band, score: 0.9, calibrated: 0.9, engine: "rules" },
+                  evidence: { entityMatch: true, matchedFields: ["name"], strategies: ["exact_name"], signals: [], nameSimilarity: 0.9, disambiguatorPresent: false },
+                  casePageUrl: `https://research.courtmesh.ai/case/${CASE_PENDING.id}`,
+                },
+              ]
+            : [],
+          relatedButUnverified: [],
+          coverage: {
+            exhaustive: true,
+            exhaustiveWithinFilters: true,
+            planClamped: false,
+            anyStrategyErrored: false,
+            strategiesRun: ["exact_name", "fuzzy_name"],
+            someRecordsWithheld: false,
+          },
+          adjudicationsRun: 0,
+          notice: "This is a records search, not a legal or compliance opinion.",
+        },
+      };
+    });
+    const creditsCharged = results.reduce((sum, r) => sum + (r.ok ? (r.screen.summary.matchCount > 0 ? 100 : 20) : 0), 0);
+    json(res, 200, {
+      success: true,
+      data: {
+        results,
+        summary: { items: items.length, matchesFound, noMatches, inconclusive: 0, errors },
+      },
+      meta: { creditsCharged, requestId: randomUUID() },
     });
     return;
   }
