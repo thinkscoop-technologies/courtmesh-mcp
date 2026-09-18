@@ -2,6 +2,46 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.4.0
+
+Adds 4 new tools (18 total) for the research server's account-introspection,
+public reference and party-screen-batch endpoints, plus the `Idempotency-Key`
+contract being rolled out across the job/charge-triggering POST endpoints.
+
+### Added
+
+- `get_api_usage`: `GET /usage`, this key's tier, wallet balance, per period
+  limits and per endpoint call volume for the current Asia/Kolkata calendar
+  month. No arguments. Unmetered.
+- `list_reference_courts`: `GET /reference/courts`, the court taxonomy
+  accepted by `court` filters elsewhere in this API. No arguments, no API
+  key required.
+- `list_reference_case_types`: `GET /reference/case-types`, every `caseType`
+  value accepted elsewhere in this API. No arguments, no API key required.
+- `screen_party_litigation_batch`: `POST /party/screen/batch`, screens 1 to
+  25 names in one call, the same DPDP-guided litigation check as
+  `screen_party_litigation` run once per item; each item independently
+  priced and independently able to fail (`ok`/`error` per result entry)
+  without failing the rest of the batch. Not available on the Free tier. No
+  `adjudicate` option in this batch form.
+- `analyze_case`, `analyze_consolidated_case`, `request_case_timeline`,
+  `screen_party_litigation` and `screen_party_litigation_batch` now send an
+  `Idempotency-Key` header automatically: a SHA-256 hash of the tool name
+  plus its exact arguments (`computeIdempotencyKey` in `src/tools.ts`, with
+  a stable, recursively key-sorted JSON serialization so argument order
+  never changes the hash). A model that retries one of these calls with
+  identical arguments is recognised server side as a replay and gets the
+  stored response back instead of a second charge or a second job run.
+  Documented in each affected tool's description; no new argument or
+  configuration needed.
+- Every error message now falls back to the `X-Request-Id` response header
+  when the error body itself carries no `requestId` field, so a caller
+  reporting a problem to CourtMesh support always has a request id to
+  quote.
+- `test/e2e/mock-api.mjs`: added `GET /usage`, `GET /reference/courts`,
+  `GET /reference/case-types` and `POST /party/screen/batch` routes; the two
+  reference routes need no API key, matching the real API.
+
 ## 0.3.0
 
 Aligned the server with the current CourtMesh public API contract (`api-v1-validations.ts`,

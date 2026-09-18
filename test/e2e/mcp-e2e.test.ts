@@ -44,6 +44,10 @@ const EXPECTED_TOOLS = [
   "screen_party_litigation",
   "get_court_coverage",
   "check_api_health",
+  "get_api_usage",
+  "list_reference_courts",
+  "list_reference_case_types",
+  "screen_party_litigation_batch",
 ];
 
 // ---------------------------------------------------------------------------
@@ -180,9 +184,9 @@ function lastRequestMatching(pathPattern: RegExp, method?: string) {
 // 1. Handshake, tools/list, schema shape
 // ---------------------------------------------------------------------------
 
-test("stdio: initialize handshake exposes exactly 14 tools with the documented names", async () => {
+test("stdio: initialize handshake exposes exactly 18 tools with the documented names", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 14, `expected 14 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
+  assert.equal(tools.length, 18, `expected 18 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
 });
@@ -402,6 +406,123 @@ test("stdio: screen_party_litigation sends purpose, entityType, and defaults adj
   assert.ok(text.includes("creditsCharged"));
   assert.ok(text.includes("100"), "a match was found, so the base price of 100 credits should be reported");
   assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: get_api_usage requires no arguments and returns tier/balance/byEndpoint", async () => {
+  const result = await stdioMain.client.callTool({ name: "get_api_usage", arguments: {} });
+  const req = lastRequestMatching(/^\/usage$/, "GET");
+  assert.ok(req, "mock did not receive GET /usage");
+  const text = resultText(result);
+  assert.ok(text.includes("tier"));
+  assert.ok(text.includes("balance"));
+  assert.ok(text.includes("byEndpoint"));
+  assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: list_reference_courts requires no API key and returns the court hierarchy", async () => {
+  const result = await stdioMain.client.callTool({ name: "list_reference_courts", arguments: {} });
+  const req = lastRequestMatching(/^\/reference\/courts$/, "GET");
+  assert.ok(req, "mock did not receive GET /reference/courts");
+  const text = resultText(result);
+  assert.ok(text.includes("courtTypes"));
+  assert.ok(text.includes("courtsByType"));
+  assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: list_reference_case_types requires no API key and returns the flattened case type list", async () => {
+  const result = await stdioMain.client.callTool({ name: "list_reference_case_types", arguments: {} });
+  const req = lastRequestMatching(/^\/reference\/case-types$/, "GET");
+  assert.ok(req, "mock did not receive GET /reference/case-types");
+  const text = resultText(result);
+  assert.ok(text.includes("fullForm"));
+  assert.ok(text.includes("primaryType"));
+  assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: screen_party_litigation_batch screens several names in one call, mixing ok and failed items", async () => {
+  const result = await stdioMain.client.callTool({
+    name: "screen_party_litigation_batch",
+    arguments: {
+      items: [
+        { clientRef: "row-1", name: "Ramesh Kumar", entityType: "person" },
+        { clientRef: "row-2", name: "FORCE_ERROR" },
+      ],
+      purpose: "due_diligence",
+    },
+  });
+  const req = lastRequestMatching(/^\/party\/screen\/batch$/, "POST");
+  assert.ok(req, "mock did not receive POST /party/screen/batch");
+  assert.equal(req!.body.purpose, "due_diligence");
+  assert.equal(req!.body.items.length, 2);
+  const text = resultText(result);
+  assert.ok(text.includes("results"));
+  assert.ok(text.includes("summary"));
+  assert.ok(text.includes("row-1"));
+  assert.ok(text.includes("row-2"));
+  assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: screen_party_litigation_batch rejects more than 25 items", async () => {
+  const items = Array.from({ length: 26 }, (_, i) => ({ name: `Person ${i}` }));
+  const result = await stdioMain.client.callTool({
+    name: "screen_party_litigation_batch",
+    arguments: { items, purpose: "kyc" },
+  });
+  assert.equal((result as any).isError, true);
+});
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key: sent automatically on the five POST tools, deterministic
+// from the tool name plus its arguments.
+// ---------------------------------------------------------------------------
+
+test("stdio: analyze_case sends a stable Idempotency-Key that is unchanged across identical retries", async () => {
+  const args = { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: true };
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: args });
+  const first = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+  assert.ok(first?.headers?.["idempotency-key"], "analyze_case must send an Idempotency-Key header");
+  assert.match(first!.headers["idempotency-key"], /^[0-9a-f]{64}$/, "expected a sha256 hex digest");
+
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: args });
+  const second = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+  assert.equal(second!.headers["idempotency-key"], first!.headers["idempotency-key"], "identical arguments must hash to the same key");
+});
+
+test("stdio: analyze_case sends a different Idempotency-Key when an argument changes", async () => {
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: true } });
+  const withForce = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: false } });
+  const withoutForce = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+  assert.notEqual(withForce!.headers["idempotency-key"], withoutForce!.headers["idempotency-key"]);
+});
+
+test("stdio: analyze_consolidated_case, request_case_timeline, screen_party_litigation and screen_party_litigation_batch all send an Idempotency-Key", async () => {
+  await stdioMain.client.callTool({ name: "analyze_consolidated_case", arguments: { id: "64f1a2b3c4d5e6f7a8b9c0d1" } });
+  assert.ok(lastRequestMatching(/analyze-consolidated$/, "POST")?.headers?.["idempotency-key"]);
+
+  await stdioMain.client.callTool({ name: "request_case_timeline", arguments: { case_id: "64f1a2b3c4d5e6f7a8b9c0d1" } });
+  assert.ok(lastRequestMatching(/^\/request-timeline$/, "POST")?.headers?.["idempotency-key"]);
+
+  await stdioMain.client.callTool({
+    name: "screen_party_litigation",
+    arguments: { name: "Ramesh Kumar", entityType: "person", purpose: "kyc" },
+  });
+  assert.ok(lastRequestMatching(/^\/party\/screen$/, "POST")?.headers?.["idempotency-key"]);
+
+  await stdioMain.client.callTool({
+    name: "screen_party_litigation_batch",
+    arguments: { items: [{ name: "Ramesh Kumar" }], purpose: "kyc" },
+  });
+  assert.ok(lastRequestMatching(/^\/party\/screen\/batch$/, "POST")?.headers?.["idempotency-key"]);
+});
+
+test("stdio: search_indian_court_cases (a non idempotency-key endpoint) sends no Idempotency-Key header", async () => {
+  await stdioMain.client.callTool({ name: "search_indian_court_cases", arguments: { query: "privacy" } });
+  const req = lastRequestMatching(/^\/search\/cases$/, "POST");
+  assert.ok(req);
+  assert.equal(req!.headers["idempotency-key"], undefined);
 });
 
 test("stdio: get_court_coverage requires no API key and returns corpus totals", async () => {
@@ -680,7 +801,7 @@ test("stdio: an unknown tool name comes back as a clear tool error, not a crash"
 
 test("stdio: the server process survives invalid arguments and keeps answering", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 14, "server must still respond normally after a rejected call");
+  assert.equal(tools.length, 18, "server must still respond normally after a rejected call");
 });
 
 // ---------------------------------------------------------------------------
@@ -709,7 +830,7 @@ test("stdio: an unrecognised (well formed) API key produces a clear 401, not a c
     assert.match(text, /401|Authentication failed/i);
     // Process must still be alive and answering.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 18);
   } finally {
     await handle.close();
   }
@@ -732,7 +853,7 @@ test("stdio: insufficient credits (402) on screen_party_litigation surfaces the 
     assert.match(text, /Shortfall:\s*58/);
     assert.match(text, /Top up at:.*api-keys#credits/);
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 14, "process must survive a 402");
+    assert.equal(tools.length, 18, "process must survive a 402");
   } finally {
     await handle.close();
   }
@@ -1005,7 +1126,7 @@ test("stdio: a hanging upstream aborts within the client's own timeout instead o
     assert.match(text, /timed out/i);
     // Process must still be alive and answering after an abort.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 18);
   } finally {
     await handle.close();
   }
@@ -1040,11 +1161,11 @@ test("http: an unauthenticated /mcp request is refused with the documented 401",
   assert.doesNotMatch(JSON.stringify(body), /node_modules|\/Users\//);
 });
 
-test("http: Authorization: Bearer with a valid key connects and lists 14 tools", async () => {
+test("http: Authorization: Bearer with a valid key connects and lists 18 tools", async () => {
   const client = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 18);
   } finally {
     await client.close();
   }
@@ -1054,7 +1175,7 @@ test("http: ?token= query parameter is honoured as an alternative to the header"
   const client = await connectHttpClient(httpMain.baseUrl, { queryToken: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 14);
+    assert.equal(tools.length, 18);
     const result = await client.callTool({ name: "get_court_coverage", arguments: {} });
     assert.notEqual((result as any).isError, true);
   } finally {
@@ -1062,7 +1183,7 @@ test("http: ?token= query parameter is honoured as an alternative to the header"
   }
 });
 
-test("http: every one of the 14 tools works over the HTTP transport with a valid key", async () => {
+test("http: every one of the 18 tools works over the HTTP transport with a valid key", async () => {
   const client = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
   try {
     const calls: Array<[string, Record<string, unknown>]> = [

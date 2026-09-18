@@ -8,6 +8,7 @@
  * calling model can recover instead of the whole turn failing.
  */
 
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -58,7 +59,14 @@ function paginationNote(pagination: any): string | undefined {
  */
 async function callApi(
   opts: ToolServerOptions,
-  reqOpts: { method?: "GET" | "POST"; path: string; query?: Record<string, any>; body?: unknown; timeoutMs?: number }
+  reqOpts: {
+    method?: "GET" | "POST";
+    path: string;
+    query?: Record<string, any>;
+    body?: unknown;
+    timeoutMs?: number;
+    idempotencyKey?: string;
+  }
 ): Promise<{ ok: true; data: any } | { ok: false; message: string }> {
   try {
     const data = await request({
@@ -86,6 +94,40 @@ function envelopeResult(body: any): CallToolResult {
   if (body?.meta !== undefined) out.meta = body.meta;
   if (body?.pagination !== undefined) out.pagination = body.pagination;
   return textResult(Object.keys(out).length > 0 ? out : body, paginationNote(body?.pagination));
+}
+
+/**
+ * Deterministic JSON serialization: object keys are sorted recursively so
+ * two calls with the same arguments in a different key order hash to the
+ * same string. Used only by computeIdempotencyKey below.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
+}
+
+/**
+ * Derives a stable `Idempotency-Key` from a tool name plus its arguments, so
+ * a model that retries the exact same tool call (its own retry logic, a
+ * dropped connection, a re-sent turn) never double-charges or double-runs a
+ * job: the second call is recognised server side as a replay of the first
+ * and returns the stored response instead of doing the work again. A call
+ * with even one different argument value hashes to a different key and runs
+ * as a brand new request, as it should.
+ *
+ * SHA-256 hex digest: exactly the `[A-Za-z0-9_.-]` charset the server's
+ * `Idempotency-Key` header requires, 64 characters, well under its 128
+ * character cap.
+ */
+export function computeIdempotencyKey(toolName: string, args: unknown): string {
+  return createHash("sha256").update(`${toolName}:${stableStringify(args ?? {})}`).digest("hex");
 }
 
 const idParam = z
@@ -415,7 +457,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "has no usable text or PDF content to analyze. Free tier note: this tool, analyze_consolidated_case, and " +
         "reading analysis on the free tier all return HTTP 403 API_TIER_NOT_ALLOWED with an upgrade URL; the " +
         "free tier gets no AI analysis at all, only keyword search, case detail, related cases, judges, PDF, " +
-        "semantic search and a limited party/screen allowance.",
+        "semantic search and a limited party/screen allowance. This call sends an Idempotency-Key derived from " +
+        "the exact id/force/allowRemoteFetch arguments, so retrying this same call (a dropped connection, a " +
+        "re-sent turn) never re-triggers analysis or re-charges credits; changing any argument runs as a new call.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run analysis even if it already exists, default false."),
@@ -443,6 +487,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: `cases/${encodeURIComponent(id)}/analyze`,
         body,
         timeoutMs: DEFAULT_TIMEOUT_MS,
+        idempotencyKey: computeIdempotencyKey("analyze_case", args),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
@@ -462,7 +507,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "analyzes up to 20 documents sharing the case number. Set force true to redo analysis that already " +
         "exists, at the cost of credits again. Fails if the case has no case number or no text content, or if AI " +
         "credits are exhausted. Free tier note: this tool returns HTTP 403 API_TIER_NOT_ALLOWED with an upgrade " +
-        "URL on the free tier, same as analyze_case; the free tier has no access to AI analysis in any form.",
+        "URL on the free tier, same as analyze_case; the free tier has no access to AI analysis in any form. " +
+        "This call sends an Idempotency-Key derived from the exact id/force arguments, so retrying this same " +
+        "call never re-runs the consolidated analysis or re-charges credits; changing any argument runs as a new call.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run consolidated analysis even if it already exists, default false."),
@@ -477,6 +524,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: `cases/${encodeURIComponent(id)}/analyze-consolidated`,
         body,
         timeoutMs: LONG_TIMEOUT_MS,
+        idempotencyKey: computeIdempotencyKey("analyze_consolidated_case", args),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
@@ -524,7 +572,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "history in this system. District Court cases are fetched synchronously and come back completed or " +
         "failed. High Court cases usually return pending and must be polled with get_case_timeline using the " +
         "returned requestId. A live refresh can take a while against a slow court portal, so this call uses a " +
-        "longer timeout than most tools.",
+        "longer timeout than most tools. This call sends an Idempotency-Key derived from the exact " +
+        "case_id/refresh arguments, so retrying this same call never re-triggers a live fetch or re-charges " +
+        "credits; changing any argument runs as a new call.",
       inputSchema: {
         case_id: z
           .string()
@@ -550,6 +600,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: "request-timeline",
         body,
         timeoutMs: TIMELINE_TIMEOUT_MS,
+        idempotencyKey: computeIdempotencyKey("request_case_timeline", args),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
@@ -639,7 +690,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "also has no semantic_search_cases access (403 SEMANTIC_NOT_ALLOWED) and no live court/timeline fetches " +
         "(request_case_timeline's refresh:true needs PAYG or above), so a Free tier litigation check is keyword " +
         "search plus deterministic party screening only. This is a records search, not a legal or compliance " +
-        "opinion; casePageUrl in each match links to the public case page.",
+        "opinion; casePageUrl in each match links to the public case page. This call sends an Idempotency-Key " +
+        "derived from every argument here, so retrying this exact same screen never re-charges credits; changing " +
+        "any argument (including name, aliases or identifiers) runs as a new, separately charged screen. Use " +
+        "screen_party_litigation_batch instead to screen more than one name in a single call.",
       inputSchema: {
         name: z
           .string()
@@ -773,6 +827,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: "party/screen",
         body,
         timeoutMs: LONG_TIMEOUT_MS,
+        idempotencyKey: computeIdempotencyKey("screen_party_litigation", args),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
@@ -796,6 +851,186 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     },
     async (): Promise<CallToolResult> => {
       const result = await callApi(opts, { method: "GET", path: "coverage" });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 15. get_api_usage ---------------------------------------------------------
+  server.registerTool(
+    "get_api_usage",
+    {
+      title: "Get API Usage",
+      description:
+        "Reports this API key's tier, wallet balance, per period limits and per endpoint call volume for the " +
+        "current Asia/Kolkata calendar month. UNMETERED: checking your own usage never itself consumes a credit. " +
+        "Returns tier, walletOwner (type: user or org, id), balance (total, monthlyGrant, signupGrant, purchased), " +
+        "limits (the full per tier limits object: requestsPerMinute, requestsPerDay, requestsPerMonth, " +
+        "maxPageSize, maxPaginationDepth, distinctCaseFetchesPerDay, pdfCallsPerMonth, aiCallsPerMonth, " +
+        "concurrentAnalyzeJobs, apiKeys, semanticSearchAllowed, liveFetchAllowed, liveFetchesPerDay, " +
+        "analysisReadAllowed, partyScreensPerMonth), period (start, end, key for the current billing month), " +
+        "creditsUsedThisPeriod, byEndpoint (calls and credits per endpoint) and subscriptionRenewsAt. Useful " +
+        "before a credit heavy call (analyze_case, analyze_consolidated_case, semantic_search_cases, " +
+        "screen_party_litigation) to check remaining balance and tier limits first.",
+      inputSchema: {},
+    },
+    async (): Promise<CallToolResult> => {
+      const result = await callApi(opts, { method: "GET", path: "usage" });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 16. list_reference_courts --------------------------------------------------
+  server.registerTool(
+    "list_reference_courts",
+    {
+      title: "List Reference Courts",
+      description:
+        "Reads the court taxonomy accepted by the court filter on search_indian_court_cases, semantic_search_cases " +
+        "and screen_party_litigation: the 4 court types (courtTypes), the court values under each type " +
+        "(courtsByType, with High Court collapsed to representative labels), and the display name(s) per court " +
+        "(courtNamesByCourt). No authentication or API key required, no AI credits consumed. Cached for 1 hour " +
+        "server side. Use this to get an exact, valid court value before filtering a search or a litigation " +
+        "screen by court, rather than guessing a spelling.",
+      inputSchema: {},
+    },
+    async (): Promise<CallToolResult> => {
+      const result = await callApi(opts, { method: "GET", path: "reference/courts" });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 17. list_reference_case_types -----------------------------------------------
+  server.registerTool(
+    "list_reference_case_types",
+    {
+      title: "List Reference Case Types",
+      description:
+        "Reads every caseType value accepted by the caseType filter on search_indian_court_cases and " +
+        "semantic_search_cases: a flat, deduplicated (by code) and sorted list, each entry carrying code, " +
+        "fullForm, primaryType and nature. No authentication or API key required, no AI credits consumed. Cached " +
+        "for 1 hour server side, same as list_reference_courts. Use this to get an exact, valid caseType value " +
+        "before filtering a search by case type, rather than guessing an abbreviation.",
+      inputSchema: {},
+    },
+    async (): Promise<CallToolResult> => {
+      const result = await callApi(opts, { method: "GET", path: "reference/case-types" });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 18. screen_party_litigation_batch --------------------------------------------
+  server.registerTool(
+    "screen_party_litigation_batch",
+    {
+      title: "Screen Party Litigation (Batch)",
+      description:
+        "Screens up to 25 person or company names against the case corpus in a single call: the same litigation, " +
+        "insolvency and related court record check as screen_party_litigation, run once per item. Each item is " +
+        "independently priced (100 credits if it finds matches, 20 if it finds none) and can independently fail " +
+        "(check ok on each entry of the returned results array; a failed item carries error.code/error.message " +
+        "and does not fail the rest of the batch). NOT AVAILABLE on the Free tier. LLM adjudication is NOT " +
+        "supported in this batch form (there is no per item or batch level adjudicate option here); call " +
+        "screen_party_litigation directly, one name at a time, when adjudication is needed. " +
+        "DPDP note, same as screen_party_litigation: purpose is REQUIRED at the batch level and is recorded as " +
+        "the lawful basis for processing every name in this batch, so pick the value that actually describes why " +
+        "this batch is being run (kyc, bgv, due_diligence, litigation, research, compliance), never a placeholder. " +
+        "IMPORTANT ABOUT WHAT A MATCH MEANS: exactly as in screen_party_litigation, a match is a case record whose " +
+        "party text matches the given name and identifiers to some confidence band, not a verified statement " +
+        "about a specific real world person or company; read each item's confidence.band and evidence before " +
+        "treating a match as identity confirmed. Each item's own screen object has the same summary.verdict rules " +
+        "(matches_found, no_matches_found, inconclusive) and the same notice/coverage.someRecordsWithheld fields " +
+        "as screen_party_litigation - always surface those per item rather than summarizing the whole batch as a " +
+        "single clean or dirty result. This call sends an Idempotency-Key derived from every argument here, so " +
+        "retrying this exact same batch never re-charges credits; changing any item runs as a new, separately " +
+        "charged batch.",
+      inputSchema: {
+        items: z
+          .array(
+            z.object({
+              clientRef: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe(
+                  "Optional caller supplied label for this item, echoed back verbatim on the matching result " +
+                    "entry (alongside its index) so you can line results up with requests. Not sent to, or used " +
+                    "by, the screening logic itself."
+                ),
+              name: z
+                .string()
+                .trim()
+                .min(2)
+                .max(200)
+                .describe("Full name to screen: a person's name or a company/entity name, 2 to 200 characters."),
+              aliases: z
+                .array(z.string().trim().min(1))
+                .max(7)
+                .optional()
+                .describe("Up to 7 alternate spellings or former names for the same person or entity."),
+              entityType: z
+                .enum(["person", "company"])
+                .optional()
+                .describe(
+                  "Whether name refers to an individual (person) or an organization (company). Falls back to " +
+                    "this call's own top level entityType when omitted on an item."
+                ),
+              identifiers: z
+                .object({
+                  pan: z.string().trim().optional(),
+                  gstin: z.string().trim().optional(),
+                  cin: z.string().trim().optional(),
+                  llpin: z.string().trim().optional(),
+                })
+                .optional()
+                .describe("Government identifiers, when known. See screen_party_litigation for details."),
+              address: z
+                .object({
+                  city: z.string().trim().optional(),
+                  state: z.string().trim().optional(),
+                  stateCode: z.string().trim().optional(),
+                })
+                .optional(),
+              knownPersons: z.array(z.string().trim().min(1)).max(10).optional(),
+              court: z
+                .union([z.string().trim(), z.array(z.string().trim()).max(1, "one court per item for now")])
+                .optional(),
+              since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD").optional(),
+              limit: z.number().int().min(1).max(100).optional(),
+              displayThreshold: z.number().min(0).max(1).optional(),
+            })
+          )
+          .min(1)
+          .max(25, "at most 25 items per batch")
+          .describe("1 to 25 items, each shaped like screen_party_litigation's own arguments (minus purpose/adjudicate, which are batch level here)."),
+        purpose: z
+          .enum(["kyc", "bgv", "due_diligence", "litigation", "research", "compliance"])
+          .describe(
+            "REQUIRED. The DPDP lawful basis for every screen in this batch. See screen_party_litigation for what " +
+              "each value means."
+          ),
+        entityType: z
+          .enum(["person", "company"])
+          .optional()
+          .describe("Default entityType applied to any item above that does not specify its own."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { items, purpose, entityType } = args as any;
+      const body: Record<string, unknown> = { items, purpose };
+      if (entityType !== undefined) body.entityType = entityType;
+
+      const result = await callApi(opts, {
+        method: "POST",
+        path: "party/screen/batch",
+        body,
+        timeoutMs: LONG_TIMEOUT_MS,
+        idempotencyKey: computeIdempotencyKey("screen_party_litigation_batch", args),
+      });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }
