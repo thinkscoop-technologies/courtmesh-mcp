@@ -253,7 +253,20 @@ function describeNotFoundError(body: any): string {
 
 function describeGenericError(status: number, body: any): string {
   const apiError: string | undefined = typeof body?.error === "string" ? body.error : undefined;
-  return `CourtMesh API returned status ${status}.${apiError ? ` Error: ${apiError}` : ""}`;
+  const message: string | undefined = typeof body?.message === "string" ? body.message : undefined;
+  const code: string | undefined = typeof body?.code === "string" ? body.code : undefined;
+  const parts: string[] = [`CourtMesh API returned status ${status}.`];
+  // 5xx/408 bodies can carry the same machine readable "code" that the 400/403/404 describers
+  // already surface (e.g. COVERAGE_NOT_READY on a 503 from /coverage); this used to be dropped
+  // here, leaving a calling model unable to branch on it the way it can for the other statuses.
+  if (code) parts.push(`Code: ${code}.`);
+  if (apiError) parts.push(`Error: ${apiError}`);
+  // "message" is often identical to "error" on these bodies; only add it when it says something
+  // "error" didn't, so the text doesn't repeat the same sentence twice.
+  if (message && message !== apiError) parts.push(message);
+  const guidance = codeGuidance(code);
+  if (guidance) parts.push(guidance);
+  return parts.join(" ");
 }
 
 /**
@@ -294,6 +307,7 @@ interface RawAttempt {
   jsonParseFailed: boolean;
   retryAfterHeader: string | null;
   requestIdHeader: string | null;
+  replayedHeader: string | null;
 }
 
 /**
@@ -373,6 +387,10 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
       jsonParseFailed,
       retryAfterHeader: response.headers.get("retry-after"),
       requestIdHeader: response.headers.get("x-request-id"),
+      // Set by the server on a POST that reused an `Idempotency-Key` within its 24 hour window:
+      // the body is the stored response from the original call, not freshly computed, and no new
+      // credits were charged. See computeIdempotencyKey in tools.ts for which calls send the key.
+      replayedHeader: response.headers.get("idempotency-replayed"),
     };
   };
 
@@ -397,7 +415,7 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
     result = await attempt();
   }
 
-  const { status, parsed, jsonParseFailed, requestIdHeader } = result;
+  const { status, parsed, jsonParseFailed, requestIdHeader, replayedHeader } = result;
 
   const errorMessage = classifyError(status, parsed);
   if (errorMessage) {
@@ -427,6 +445,14 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
       `CourtMesh API returned status ${status} for ${method} ${path} with a body that was not valid JSON. ` +
         "This is an unexpected upstream response, not a problem with your request. Try again shortly."
     );
+  }
+
+  // Surface the replay signal on the response object itself, so a caller (tools.ts) can tell an
+  // idempotency-cache replay apart from a freshly computed result without inspecting headers
+  // itself. Only meaningful on the five idempotency-key endpoints, but harmless to set generally:
+  // false just means "not a replay" (including "no Idempotency-Key was ever sent").
+  if (parsed && typeof parsed === "object") {
+    (parsed as any).replayed = replayedHeader === "true";
   }
 
   return parsed as T;

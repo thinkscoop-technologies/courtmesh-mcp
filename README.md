@@ -70,6 +70,8 @@ This server supports two transports, chosen at startup:
 
 `analyze_case`, `analyze_consolidated_case`, `request_case_timeline`, `screen_party_litigation` and `screen_party_litigation_batch` each send an `Idempotency-Key` header automatically, derived as a SHA-256 hash of the tool name plus its exact arguments (see `computeIdempotencyKey` in `src/tools.ts`). If a model retries one of these calls with identical arguments, whether because of its own retry logic, a dropped connection, or a re-sent turn, the server recognises the replay (same key, same body) and returns the stored response again instead of re-running the job or re-charging credits. Changing even one argument produces a different key and runs as a brand new, separately charged call. This requires no configuration and needs no argument from the calling model.
 
+When a call is served from that cache, the server answers with an `Idempotency-Replayed: true` header; `client.ts` turns that into a `replayed: true` field on the parsed response, and the tool result text for all five of these tools starts with a `Replayed: identical request served from the 24 hour idempotency cache, no credits charged.` line, so the calling model (and anyone reading a transcript) has a positive, explicit signal instead of having to notice on its own that, for example, `screen_party_litigation` redacted `query.name`/`query.aliases` on that response.
+
 ## Configuration examples
 
 ### Claude Desktop

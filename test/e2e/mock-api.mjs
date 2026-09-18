@@ -225,6 +225,29 @@ function presentedKey(req) {
   return undefined;
 }
 
+/**
+ * Monkey patches res.writeHead/res.end for the duration of one route() call so the caller can
+ * read back the status and raw body text that were about to be sent, without changing what the
+ * real client actually receives. Used only to implement the Idempotency-Key replay simulation
+ * below: the first response for a given key must be captured so it can be replayed verbatim.
+ */
+function captureResponse(res) {
+  const originalWriteHead = res.writeHead.bind(res);
+  const originalEnd = res.end.bind(res);
+  const capture = { status: undefined, bodyText: undefined };
+  res.writeHead = (status, headers) => {
+    capture.status = status;
+    return originalWriteHead(status, headers);
+  };
+  res.end = (chunk, ...rest) => {
+    capture.bodyText = chunk;
+    res.writeHead = originalWriteHead;
+    res.end = originalEnd;
+    return originalEnd(chunk, ...rest);
+  };
+  return capture;
+}
+
 function redactedHeaders(req) {
   const out = {};
   for (const [k, v] of Object.entries(req.headers)) {
@@ -324,7 +347,16 @@ function scenario400TierCapBody() {
 }
 
 function scenario503Body() {
-  return { success: false, error: "Coverage data is temporarily unavailable. Please try again shortly." };
+  // Matches the real API's shape exactly (confirmed via raw REST in
+  // QA_LIVE_MCP_AUTH_2026-09-19.md, finding 4): "code" is present alongside "error"/"message" on
+  // this 5xx, and describeGenericError in src/client.ts must surface it like the 400/403/404
+  // describers already do.
+  return {
+    success: false,
+    code: "COVERAGE_NOT_READY",
+    error: "Coverage data is temporarily unavailable. Please try again shortly.",
+    message: "Coverage data is temporarily unavailable. Please try again shortly.",
+  };
 }
 
 function scenarioCursorInvalidBody() {
@@ -422,6 +454,10 @@ export async function startMockApi() {
   // request after that for the same key falls through to the normal, successful route - this is
   // what proves the real MCP client's single bounded GET retry actually works end to end.
   const rateLimitRetryCounts = new Map();
+  // Idempotency-Key -> { status, bodyText } for the first successful response seen with that
+  // key, so a later request presenting the same key gets the identical response back with
+  // Idempotency-Replayed: true, per the Idempotency-Key replay simulation below.
+  const idempotencyStore = new Map();
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
@@ -500,6 +536,27 @@ export async function startMockApi() {
         unauthorized(res);
         return;
       }
+    }
+
+    // Idempotency-Key replay simulation. The real API scopes this per key for 24 hours (see
+    // computeIdempotencyKey in src/tools.ts); this mock keeps it simple and process lifetime
+    // long, which is enough for the e2e suite. Only a successful (2xx) first response is cached,
+    // matching the documented "returns the stored 2xx response again" behavior; an error response
+    // is never stored, so a caller can freely retry a failed call with the same key.
+    const idempotencyKeyHeader = req.headers["idempotency-key"];
+    if (typeof idempotencyKeyHeader === "string" && idempotencyKeyHeader.length > 0) {
+      const stored = idempotencyStore.get(idempotencyKeyHeader);
+      if (stored) {
+        res.writeHead(stored.status, { "Content-Type": "application/json", "Idempotency-Replayed": "true" });
+        res.end(stored.bodyText);
+        return;
+      }
+      const capture = captureResponse(res);
+      route(pathname, method, url, body, res, { timelineJobs });
+      if (capture.status >= 200 && capture.status < 300 && typeof capture.bodyText === "string") {
+        idempotencyStore.set(idempotencyKeyHeader, { status: capture.status, bodyText: capture.bodyText });
+      }
+      return;
     }
 
     route(pathname, method, url, body, res, { timelineJobs });
@@ -599,8 +656,13 @@ function route(pathname, method, url, body, res, ctx) {
       });
       return;
     }
+    // Deliberately mongoId, not id: the real /search/cases OpenSearch index does not return an
+    // "id" field at all (QA_LIVE_MCP_AUTH_2026-09-19.md, finding 2), only mongoId, unlike
+    // semantic_search_cases below which does return a real id. This is what
+    // backfillSearchHitIds in src/tools.ts must fill in for the tool result to actually satisfy
+    // its own documented "id field from search results" instruction.
     const hits = [CASE_PENDING, CASE_ANALYZED].map((c) => ({
-      id: c.id,
+      mongoId: c.id,
       caseNumber: c.caseNumber,
       title: c.title,
       court: c.court,

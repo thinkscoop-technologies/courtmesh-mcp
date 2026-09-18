@@ -2,6 +2,46 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.4.1
+
+Three fixes from a live authenticated QA pass against the hosted server
+(`QA_LIVE_MCP_AUTH_2026-09-19.md`), all in the shared client/tool plumbing
+rather than any single endpoint.
+
+### Fixed
+
+- `client.ts`'s `describeGenericError` (the 500/502/503/408 error path) used
+  to surface only `body.error`, dropping `body.code` and `body.message` even
+  when the API sent them - unlike `describeForbiddenError` and
+  `describeNotFoundError`, which already surfaced `code`. A `get_court_coverage`
+  503 with `code: "COVERAGE_NOT_READY"` now reads `CourtMesh API returned
+  status 503. Code: COVERAGE_NOT_READY. Error: ...`, and any other 5xx/408
+  carrying a machine readable `code` is handled the same way.
+- `analyze_case`, `analyze_consolidated_case`, `request_case_timeline`,
+  `screen_party_litigation` and `screen_party_litigation_batch` now surface an
+  explicit replay signal. `client.ts`'s `request()` reads the
+  `Idempotency-Replayed` response header and sets `replayed: true/false` on
+  the parsed body; when true, the tool result text now starts with the line
+  `Replayed: identical request served from the 24 hour idempotency cache, no
+  credits charged.`, before this the only (undocumented) tell was
+  `screen_party_litigation`'s `query.name`/`query.aliases` coming back as
+  redaction placeholders instead of their literal values.
+- `search_indian_court_cases`: the live `/search/cases` index returns
+  `mongoId` on each hit, not `id`, even though every other tool here
+  (`get_case`, `find_related_cases`, `get_case_pdf_url`, and especially
+  `request_case_timeline`) documents passing in "the id field from search
+  results". Hits missing `id` now get it backfilled from `mongoId`
+  (`backfillSearchHitIds` in `src/tools.ts`); `mongoId` is left in place
+  alongside it, and a hit that already has its own `id` is untouched, so this
+  keeps working once the server starts adding `id` itself.
+- `test/e2e/mock-api.mjs`: `scenario503Body` now carries `code:
+  "COVERAGE_NOT_READY"` (matching the real API body confirmed via raw REST in
+  the QA report), `/search/cases` hits now carry `mongoId` instead of `id`
+  (matching the real index), and a new `Idempotency-Key` replay simulation
+  (an in-memory `idempotencyStore` plus a `captureResponse` helper) replays
+  the first stored 2xx response with `Idempotency-Replayed: true` for a
+  repeated key, so the replay path is actually exercised end to end.
+
 ## 0.4.0
 
 Adds 4 new tools (18 total) for the research server's account-introspection,
