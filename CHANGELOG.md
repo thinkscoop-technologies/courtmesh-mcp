@@ -2,6 +2,69 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.4.2
+
+### Fixed
+
+- **Idempotency keys are now scoped per session.** `computeIdempotencyKey`
+  (`src/tools.ts`) used to derive the `Idempotency-Key` header from the tool
+  name and arguments alone, so two unrelated callers who happened to send
+  byte identical arguments within the server's 24 hour idempotency window
+  would silently replay each other's cached result, with no signal beyond
+  the ordinary "Replayed: ..." note. A `sessionSalt` is now mixed into every
+  key: over stdio it is a random value generated once per process
+  (`runStdio` in `src/index.ts`); over Streamable HTTP it is the
+  `Mcp-Session-Id` assigned to that session at initialize, generated up
+  front so it can double as the salt and threaded through the per session
+  `McpServer` via `ToolServerOptions.sessionSalt`. Retries within one
+  session still replay, which is the point.
+- Added an optional `fresh` boolean argument to the five POST-backed tools
+  (`analyze_case`, `analyze_consolidated_case`, `request_case_timeline`,
+  `screen_party_litigation`, `screen_party_litigation_batch`). Setting it
+  true mixes a random nonce into the Idempotency-Key so that call is always
+  treated as new and charged accordingly, bypassing the replay cache for
+  that one call; the flag itself is never sent to the CourtMesh API. Each
+  tool's description now also states plainly that a repeat with the same
+  arguments in the same session replays without a second charge.
+- **CORS on the hosted HTTP transport.** `/mcp` and `/health` used to answer
+  an `OPTIONS` preflight with the catch-all JSON-RPC 404 and no CORS
+  headers, so a browser based MCP client could never complete its preflight.
+  `src/index.ts` now answers `OPTIONS` on both routes directly with 204, and
+  every response on both routes carries `Access-Control-Allow-Origin: *`,
+  `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` (including
+  `Authorization`, `Content-Type`, `Mcp-Session-Id`, `Mcp-Protocol-Version`)
+  and `Access-Control-Expose-Headers: Mcp-Session-Id`. Origin `*` is fine
+  here because authentication is a bearer API key, never a cookie or other
+  ambient browser credential.
+- `test/e2e/openapi.json` regenerated from the live
+  `https://research.courtmesh.ai/api/v1/prod/openapi.json` (spec `1.1.0` / 14
+  paths -> `1.2.0` / 20 paths: adds `/audit`, `/me`, `/party/screen/batch`,
+  `/reference/case-types`, `/reference/courts`, `/usage`). This file is a
+  reference artifact for keeping `test/e2e/mock-api.mjs` in sync with the
+  real API shape; it is not loaded by the test suite, so the e2e suite
+  passes unchanged (77 tests).
+- `test/e2e/dump-openapi.mjs` no longer hardcodes one contributor's absolute
+  laptop path to the research repo's `openapi.ts` (this is a public repo).
+  Both the source module path and the output path are now optional CLI
+  arguments, defaulting to the standard sibling checkout layout and to
+  `test/e2e/openapi.json` respectively.
+- README's hosted HTTP mode section no longer hedges
+  `https://mcp.courtmesh.ai` as "once this server is deployed": it is live,
+  and the section now shows both the `Authorization: Bearer` header form
+  (preferred) and the `?token=` query parameter form.
+- `package.json`'s `repository` and newly added `bugs` fields now point at
+  the real GitHub org, `thinkscoop-technologies`, not `courtmesh`; `homepage`
+  now points at that same repository.
+
+### Added
+
+- `.github/workflows/publish.yml`: on a pushed `v*` tag, runs `npm ci`, the
+  unit and e2e test suites, `npm run build`, then `npm publish --access
+  public --provenance` using the `NPM_TOKEN` secret. Not run as part of this
+  change; see `release.md` for the manual steps to cut a release.
+- `release.md`: the exact human steps for a release (`npm login` once,
+  `npm version patch`, `git push --follow-tags`).
+
 ## 0.4.1
 
 Three fixes from a live authenticated QA pass against the hosted server

@@ -1,6 +1,6 @@
 {
   "name": "@courtmesh/mcp-server",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "MCP server for the CourtMesh public REST API: search and analyze 310M+ Indian court case records from Supreme Court, High Courts, District Courts and tribunals.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "start": "node dist/index.js",
-    "test": "npm run build && node --test test/http-transport.test.mjs",
+    "test": "npm run build && node --test test/http-transport.test.mjs test/idempotency-key.test.mjs",
     "test:e2e": "npm run build && node --import tsx --test test/e2e/mcp-e2e.test.ts",
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
@@ -39,9 +39,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/courtmesh/courtmesh-mcp.git"
+    "url": "git+https://github.com/thinkscoop-technologies/courtmesh-mcp.git"
   },
-  "homepage": "https://research.courtmesh.ai",
+  "bugs": {
+    "url": "https://github.com/thinkscoop-technologies/courtmesh-mcp/issues"
+  },
+  "homepage": "https://github.com/thinkscoop-technologies/courtmesh-mcp#readme",
   "publishConfig": {
     "access": "public"
   },

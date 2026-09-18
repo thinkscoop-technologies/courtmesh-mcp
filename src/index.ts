@@ -26,7 +26,7 @@ import { apiKeyOverrideStorage } from "./context.js";
 import { DEFAULT_BASE_URL, isValidApiKeyFormat } from "./client.js";
 
 const SERVER_NAME = "courtmesh-mcp";
-const SERVER_VERSION = "0.4.1";
+const SERVER_VERSION = "0.4.2";
 
 const baseUrl = process.env.COURTMESH_API_BASE_URL?.trim() || DEFAULT_BASE_URL;
 const apiKey = process.env.COURTMESH_API_KEY?.trim() || undefined;
@@ -42,15 +42,27 @@ function warnIfKeyLooksWrong(key: string | undefined, sourceLabel: string): void
   }
 }
 
-function createServer(): McpServer {
+/**
+ * `sessionSalt` scopes the Idempotency-Key this process computes (see
+ * computeIdempotencyKey in tools.ts) so a replay only ever happens within one
+ * session: over stdio the caller passes a random value generated once for
+ * the life of the process (runStdio, below); over Streamable HTTP each
+ * session gets its own McpServer via createServer, and runHttp passes the
+ * Mcp-Session-Id that was just assigned to that session.
+ */
+function createServer(sessionSalt: string): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  registerCourtMeshTools(server, { baseUrl, apiKey });
+  registerCourtMeshTools(server, { baseUrl, apiKey, sessionSalt });
   return server;
 }
 
 async function runStdio(): Promise<void> {
   warnIfKeyLooksWrong(apiKey, "COURTMESH_API_KEY environment variable");
-  const server = createServer();
+  // One random salt for the life of this process: every tool call made over
+  // this stdio connection shares it, so retries within this session replay
+  // as intended, and there is no other session to collide with.
+  const sessionSalt = randomUUID();
+  const server = createServer(sessionSalt);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(`[courtmesh-mcp] stdio transport ready, base URL ${baseUrl}.`);
@@ -171,6 +183,35 @@ async function runHttp(): Promise<void> {
   // The limit is Express's own default, stated explicitly so it is a decision
   // rather than an accident: a JSON-RPC tool call is a few kilobytes.
   app.use(express.json({ limit: "100kb" }));
+
+  /*
+   * CORS for /mcp and /health.
+   *
+   * Origin * is fine here: authentication is a bearer API key (or ?token=),
+   * never a cookie or other ambient browser credential, so there is nothing
+   * for a third party origin to ride along with. Without this, a browser
+   * based MCP client (running in a web page rather than a desktop app) could
+   * not complete its CORS preflight and every request would fail before it
+   * ever reached handleMcpRequest; this used to fall through to the catch-all
+   * 404 further down, which answers an OPTIONS preflight with a JSON-RPC
+   * error body and no CORS headers at all.
+   *
+   * Mcp-Session-Id and Mcp-Protocol-Version are allowed in because the SDK's
+   * Streamable HTTP client sends both; Mcp-Session-Id is also exposed so the
+   * client can read the id the server assigns on initialize (browsers hide
+   * response headers from script by default unless explicitly exposed).
+   */
+  app.use(["/mcp", "/health"], (req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   // Plain health check for the HTTP server process itself, distinct from the
   // check_api_health tool, which checks the upstream CourtMesh API instead.
@@ -347,11 +388,16 @@ async function runHttp(): Promise<void> {
       }
       makeRoomFor(keyHash);
 
-      const server = createServer();
+      // Generated up front, rather than left to the transport's own
+      // sessionIdGenerator, so this exact id can double as the session's
+      // Idempotency-Key salt (see createServer): the salt IS the
+      // Mcp-Session-Id the client will be handed at the end of this request.
+      const newSessionId = randomUUID();
+      const server = createServer(newSessionId);
       const created = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (newSessionId) => {
-          sessions.set(newSessionId, {
+        sessionIdGenerator: () => newSessionId,
+        onsessioninitialized: (initializedSessionId) => {
+          sessions.set(initializedSessionId, {
             transport: created,
             server,
             keyHash,

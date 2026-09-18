@@ -136,7 +136,24 @@ Edit `~/.cursor/mcp.json`:
 
 ### Hosted HTTP mode
 
-Once this server is deployed behind a public URL, point any Streamable HTTP capable MCP client at it directly, no local process required. Pass your key as a query parameter, it overrides `COURTMESH_API_KEY` for that session:
+`https://mcp.courtmesh.ai/mcp` is live: point any Streamable HTTP capable MCP client at it directly, no local process required. Send your key either as an `Authorization: Bearer` header (preferred) or as a `?token=` query parameter, for clients that can only configure a URL; either form overrides `COURTMESH_API_KEY` for that session.
+
+Header form:
+
+```json
+{
+  "mcpServers": {
+    "courtmesh": {
+      "url": "https://mcp.courtmesh.ai/mcp",
+      "headers": {
+        "Authorization": "Bearer cm-your-key-here"
+      }
+    }
+  }
+}
+```
+
+Query parameter form, for a client that cannot set headers:
 
 ```json
 {

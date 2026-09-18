@@ -525,6 +525,40 @@ test("stdio: search_indian_court_cases (a non idempotency-key endpoint) sends no
   assert.equal(req!.headers["idempotency-key"], undefined);
 });
 
+test("stdio: fresh:true sends a different Idempotency-Key than the plain call, and is never forwarded to the API", async () => {
+  const args = { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: true };
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: args });
+  const plain = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: { ...args, fresh: true } });
+  const freshOne = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+  assert.notEqual(freshOne!.headers["idempotency-key"], plain!.headers["idempotency-key"], "fresh:true must bypass the replay cache");
+  assert.equal(freshOne!.body?.fresh, undefined, "fresh must never be sent to the CourtMesh API itself");
+
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: { ...args, fresh: true } });
+  const freshTwo = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+  assert.notEqual(freshTwo!.headers["idempotency-key"], freshOne!.headers["idempotency-key"], "every fresh:true call must get its own key, not just the first one");
+});
+
+test("stdio: two separate sessions never share an Idempotency-Key for identical tool arguments", async () => {
+  const args = { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: true };
+  await stdioMain.client.callTool({ name: "analyze_case", arguments: args });
+  const fromMain = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+  const other = await startStdioClient({ COURTMESH_API_KEY: mock.KEYS.valid, COURTMESH_API_BASE_URL: mock.baseUrl });
+  try {
+    await other.client.callTool({ name: "analyze_case", arguments: args });
+    const fromOther = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+    assert.notEqual(
+      fromOther!.headers["idempotency-key"],
+      fromMain!.headers["idempotency-key"],
+      "identical arguments from a different session (a different stdio process) must never replay this session's call"
+    );
+  } finally {
+    await other.close();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Idempotency-Key REPLAY: QA_LIVE_MCP_AUTH_2026-09-19.md finding 3. The server marks a replayed
 // response with an `Idempotency-Replayed: true` header (simulated by the mock's idempotency
@@ -1243,6 +1277,30 @@ test("http: ?token= query parameter is honoured as an alternative to the header"
     assert.notEqual((result as any).isError, true);
   } finally {
     await client.close();
+  }
+});
+
+test("http: two sessions opened with the same API key never share an Idempotency-Key for identical arguments", async () => {
+  const clientA = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
+  const clientB = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
+  try {
+    const args = { id: "64f1a2b3c4d5e6f7a8b9c0d1", force: true };
+    await clientA.callTool({ name: "analyze_case", arguments: args });
+    const fromA = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+    await clientB.callTool({ name: "analyze_case", arguments: args });
+    const fromB = lastRequestMatching(/^\/cases\/64f1a2b3c4d5e6f7a8b9c0d1\/analyze$/, "POST");
+
+    assert.ok(fromA?.headers?.["idempotency-key"]);
+    assert.ok(fromB?.headers?.["idempotency-key"]);
+    assert.notEqual(
+      fromA!.headers["idempotency-key"],
+      fromB!.headers["idempotency-key"],
+      "the same API key opening two Streamable HTTP sessions must not let one session replay the other's call"
+    );
+  } finally {
+    await clientA.close();
+    await clientB.close();
   }
 });
 

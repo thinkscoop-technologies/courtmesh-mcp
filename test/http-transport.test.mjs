@@ -264,3 +264,58 @@ test('an unknown path is a JSON 404, and health needs no credential', async () =
     assert.equal(healthBody.status, 'ok');
   });
 });
+
+// ---------------------------------------------------------------------------
+// CORS: a browser based client can reach /mcp and /health
+// ---------------------------------------------------------------------------
+
+test('an OPTIONS preflight on /mcp is answered directly, with no session allocated', async () => {
+  await withServer({}, async (base) => {
+    const res = await fetch(`${base}/mcp`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'https://example.com',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'authorization, content-type, mcp-session-id',
+      },
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get('mcp-session-id'), null, 'a preflight must not allocate a session');
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.match(res.headers.get('access-control-allow-methods') ?? '', /POST/);
+    assert.match(res.headers.get('access-control-allow-methods') ?? '', /OPTIONS/);
+    const allowHeaders = (res.headers.get('access-control-allow-headers') ?? '').toLowerCase();
+    assert.match(allowHeaders, /authorization/);
+    assert.match(allowHeaders, /content-type/);
+    assert.match(allowHeaders, /mcp-session-id/);
+    assert.match(allowHeaders, /mcp-protocol-version/);
+    assert.equal(res.headers.get('access-control-expose-headers'), 'Mcp-Session-Id');
+  });
+});
+
+test('an OPTIONS preflight on /health is answered the same way, with no credential', async () => {
+  await withServer({}, async (base) => {
+    const res = await fetch(`${base}/health`, { method: 'OPTIONS' });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+  });
+});
+
+test('the actual /mcp and /health responses also carry the CORS headers, not just the preflight', async () => {
+  await withServer({}, async (base) => {
+    const health = await fetch(`${base}/health`);
+    await health.text();
+    assert.equal(health.headers.get('access-control-allow-origin'), '*');
+
+    const init = await post(base, { key: KEY_A });
+    assert.equal(init.headers.get('access-control-allow-origin'), '*');
+    assert.equal(init.headers.get('access-control-expose-headers'), 'Mcp-Session-Id');
+  });
+});
+
+test('an unrelated path is not given CORS headers', async () => {
+  await withServer({}, async (base) => {
+    const res = await fetch(`${base}/wp-admin/setup-config.php`, { method: 'OPTIONS' });
+    assert.equal(res.headers.get('access-control-allow-origin'), null);
+  });
+});

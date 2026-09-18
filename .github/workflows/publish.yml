@@ -1,0 +1,47 @@
+name: Publish to npm
+
+# Fires only on a pushed tag matching v*, e.g. v0.4.2. See release.md for the
+# exact steps that create such a tag (npm version + git push --follow-tags).
+# This workflow never runs on an ordinary push or pull request, and never
+# bumps the version itself: it publishes exactly what npm version already
+# committed and tagged.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  # Required for npm provenance: the OIDC token that lets npm attest this
+  # package was built by this exact workflow run, from this exact commit.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Run end to end tests
+        run: npm run test:e2e
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

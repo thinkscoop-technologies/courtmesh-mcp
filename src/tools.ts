@@ -8,7 +8,7 @@
  * calling model can recover instead of the whole turn failing.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -18,6 +18,19 @@ import { getApiKeyOverride } from "./context.js";
 export interface ToolServerOptions {
   baseUrl: string;
   apiKey: string | undefined;
+  /**
+   * Mixed into every Idempotency-Key this server computes (see
+   * computeIdempotencyKey), so a replay only ever happens within the caller's
+   * own session: over stdio this is a random value generated once per
+   * process, and over Streamable HTTP it is the Mcp-Session-Id assigned when
+   * that session was initialized (see createServer in src/index.ts). Before
+   * this existed the key was derived from the tool name and arguments alone,
+   * so two unrelated callers who happened to send byte identical arguments
+   * within the same 24 hour window would silently replay each other's cached
+   * result, with no signal beyond the "Replayed:" note that this had even
+   * happened.
+   */
+  sessionSalt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,13 +171,46 @@ function stableStringify(value: unknown): string {
  * with even one different argument value hashes to a different key and runs
  * as a brand new request, as it should.
  *
+ * `sessionSalt` (see ToolServerOptions) is mixed in so the key space is
+ * scoped to one session: identical arguments sent from two different
+ * sessions (two separate MCP clients, or two separate stdio processes) hash
+ * to two different keys and never replay one another, even inside the
+ * server's 24 hour idempotency window. Retries *within* one session still
+ * replay, which is the point.
+ *
+ * `nonce`, when supplied (see the `fresh` argument on the five POST-backed
+ * tools), is mixed in too so the caller can deliberately force a fresh key
+ * for otherwise identical arguments in the same session, bypassing the
+ * replay cache for that one call. Omit it for the normal, replay-eligible
+ * key.
+ *
  * SHA-256 hex digest: exactly the `[A-Za-z0-9_.-]` charset the server's
  * `Idempotency-Key` header requires, 64 characters, well under its 128
  * character cap.
  */
-export function computeIdempotencyKey(toolName: string, args: unknown): string {
-  return createHash("sha256").update(`${toolName}:${stableStringify(args ?? {})}`).digest("hex");
+export function computeIdempotencyKey(
+  toolName: string,
+  args: unknown,
+  sessionSalt: string,
+  nonce?: string
+): string {
+  const noncePart = nonce !== undefined ? `:fresh:${nonce}` : "";
+  return createHash("sha256")
+    .update(`${sessionSalt}:${toolName}:${stableStringify(args ?? {})}${noncePart}`)
+    .digest("hex");
 }
+
+/** Optional boolean schema shared by the five POST-backed tools' `fresh` argument. */
+const freshParam = z
+  .boolean()
+  .optional()
+  .describe(
+    "Default false. A repeat call with otherwise identical arguments in this same session replays the cached " +
+      "result within 24 hours and is not charged again (see the Idempotency-Key note below). Set fresh true to " +
+      "bypass that and force a genuine re-run: this mixes a random nonce into the Idempotency-Key so the call is " +
+      "always treated as new, even if every other argument is unchanged, and is charged accordingly. This flag " +
+      "itself is never sent to the CourtMesh API."
+  );
 
 const idParam = z
   .string()
@@ -498,10 +544,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "reading analysis on the free tier all return HTTP 403 API_TIER_NOT_ALLOWED with an upgrade URL; the " +
         "free tier gets no AI analysis at all, only keyword search, case detail, related cases, judges, PDF, " +
         "semantic search and a limited party/screen allowance. This call sends an Idempotency-Key derived from " +
-        "the exact id/force/allowRemoteFetch arguments, so retrying this same call (a dropped connection, a " +
-        "re-sent turn) never re-triggers analysis or re-charges credits; changing any argument runs as a new call. " +
-        "When a replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it apart from " +
-        "a freshly computed result.",
+        "the exact id/force/allowRemoteFetch arguments plus this session, so retrying this same call in this same " +
+        "session (a dropped connection, a re-sent turn) never re-triggers analysis or re-charges credits; the " +
+        "identical call from a different session is never treated as a replay of this one, and changing any " +
+        "argument here also runs as a new call. When a replay happens, the result text starts with a " +
+        "\"Replayed: ...\" line so you can tell it apart from a freshly computed result. Set fresh true to force a " +
+        "re-run, see the fresh argument.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run analysis even if it already exists, default false."),
@@ -517,10 +565,11 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
               "happens, a 20 credit surcharge is added on top of the base analyze price. Not available on the " +
               "Free tier, which returns 403 REMOTE_FETCH_NOT_ALLOWED regardless of this flag."
           ),
+        fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { id, force, allowRemoteFetch } = args as any;
+      const { id, force, allowRemoteFetch, fresh } = args as any;
       const body: Record<string, unknown> = {};
       if (force !== undefined) body.force = force;
       if (allowRemoteFetch !== undefined) body.allowRemoteFetch = allowRemoteFetch;
@@ -529,7 +578,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: `cases/${encodeURIComponent(id)}/analyze`,
         body,
         timeoutMs: DEFAULT_TIMEOUT_MS,
-        idempotencyKey: computeIdempotencyKey("analyze_case", args),
+        idempotencyKey: computeIdempotencyKey(
+          "analyze_case",
+          { id, force, allowRemoteFetch },
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
@@ -550,17 +604,20 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "exists, at the cost of credits again. Fails if the case has no case number or no text content, or if AI " +
         "credits are exhausted. Free tier note: this tool returns HTTP 403 API_TIER_NOT_ALLOWED with an upgrade " +
         "URL on the free tier, same as analyze_case; the free tier has no access to AI analysis in any form. " +
-        "This call sends an Idempotency-Key derived from the exact id/force arguments, so retrying this same " +
-        "call never re-runs the consolidated analysis or re-charges credits; changing any argument runs as a new " +
-        "call. When a replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it " +
-        "apart from a freshly computed result.",
+        "This call sends an Idempotency-Key derived from the exact id/force arguments plus this session, so " +
+        "retrying this same call in this same session never re-runs the consolidated analysis or re-charges " +
+        "credits; the identical call from a different session is never treated as a replay of this one, and " +
+        "changing any argument here also runs as a new call. When a replay happens, the result text starts with a " +
+        "\"Replayed: ...\" line so you can tell it apart from a freshly computed result. Set fresh true to force a " +
+        "re-run, see the fresh argument.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run consolidated analysis even if it already exists, default false."),
+        fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { id, force } = args as any;
+      const { id, force, fresh } = args as any;
       const body: Record<string, unknown> = {};
       if (force !== undefined) body.force = force;
       const result = await callApi(opts, {
@@ -568,7 +625,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: `cases/${encodeURIComponent(id)}/analyze-consolidated`,
         body,
         timeoutMs: LONG_TIMEOUT_MS,
-        idempotencyKey: computeIdempotencyKey("analyze_consolidated_case", args),
+        idempotencyKey: computeIdempotencyKey(
+          "analyze_consolidated_case",
+          { id, force },
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
@@ -617,9 +679,11 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "failed. High Court cases usually return pending and must be polled with get_case_timeline using the " +
         "returned requestId. A live refresh can take a while against a slow court portal, so this call uses a " +
         "longer timeout than most tools. This call sends an Idempotency-Key derived from the exact " +
-        "case_id/refresh arguments, so retrying this same call never re-triggers a live fetch or re-charges " +
-        "credits; changing any argument runs as a new call. When a replay happens, the result text starts with a " +
-        "\"Replayed: ...\" line so you can tell it apart from a freshly computed result.",
+        "case_id/refresh arguments plus this session, so retrying this same call in this same session never " +
+        "re-triggers a live fetch or re-charges credits; the identical call from a different session is never " +
+        "treated as a replay of this one, and changing any argument here also runs as a new call. When a replay " +
+        "happens, the result text starts with a \"Replayed: ...\" line so you can tell it apart from a freshly " +
+        "computed result. Set fresh true to force a re-run, see the fresh argument.",
       inputSchema: {
         case_id: z
           .string()
@@ -634,10 +698,11 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
               "PAYG tier or above only (403 LIVE_FETCH_NOT_ALLOWED on Free), and capped per day per tier (429 " +
               "LIVE_FETCH_LIMIT_REACHED once exhausted)."
           ),
+        fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { case_id, refresh } = args as any;
+      const { case_id, refresh, fresh } = args as any;
       const body: Record<string, unknown> = { case_id };
       if (refresh !== undefined) body.refresh = refresh;
       const result = await callApi(opts, {
@@ -645,7 +710,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: "request-timeline",
         body,
         timeoutMs: TIMELINE_TIMEOUT_MS,
-        idempotencyKey: computeIdempotencyKey("request_case_timeline", args),
+        idempotencyKey: computeIdempotencyKey(
+          "request_case_timeline",
+          { case_id, refresh },
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
@@ -736,11 +806,13 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "(request_case_timeline's refresh:true needs PAYG or above), so a Free tier litigation check is keyword " +
         "search plus deterministic party screening only. This is a records search, not a legal or compliance " +
         "opinion; casePageUrl in each match links to the public case page. This call sends an Idempotency-Key " +
-        "derived from every argument here, so retrying this exact same screen never re-charges credits; changing " +
-        "any argument (including name, aliases or identifiers) runs as a new, separately charged screen. When a " +
-        "replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it apart from a " +
-        "freshly computed result (in addition to query.name/query.aliases coming back redacted, same as any " +
-        "stored record). Use screen_party_litigation_batch instead to screen more than one name in a single call.",
+        "derived from every argument here plus this session, so retrying this exact same screen in this same " +
+        "session never re-charges credits; the identical screen from a different session is never treated as a " +
+        "replay of this one, and changing any argument (including name, aliases or identifiers) here also runs as " +
+        "a new, separately charged screen. When a replay happens, the result text starts with a \"Replayed: ...\" " +
+        "line so you can tell it apart from a freshly computed result (in addition to query.name/query.aliases " +
+        "coming back redacted, same as any stored record). Set fresh true to force a re-run, see the fresh " +
+        "argument. Use screen_party_litigation_batch instead to screen more than one name in a single call.",
       inputSchema: {
         name: z
           .string()
@@ -841,6 +913,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
               "this can make matches empty (matchCount 0) even though summary.verdict still reads matches_found - " +
               "see the tool description. Omit to use the service default (0.6)."
           ),
+        fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
@@ -857,6 +930,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         limit,
         adjudicate,
         displayThreshold,
+        fresh,
       } = args as any;
       const body: Record<string, unknown> = { name, entityType, purpose };
       if (aliases !== undefined) body.aliases = aliases;
@@ -874,7 +948,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: "party/screen",
         body,
         timeoutMs: LONG_TIMEOUT_MS,
-        idempotencyKey: computeIdempotencyKey("screen_party_litigation", args),
+        idempotencyKey: computeIdempotencyKey(
+          "screen_party_litigation",
+          body,
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
@@ -991,10 +1070,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "treating a match as identity confirmed. Each item's own screen object has the same summary.verdict rules " +
         "(matches_found, no_matches_found, inconclusive) and the same notice/coverage.someRecordsWithheld fields " +
         "as screen_party_litigation - always surface those per item rather than summarizing the whole batch as a " +
-        "single clean or dirty result. This call sends an Idempotency-Key derived from every argument here, so " +
-        "retrying this exact same batch never re-charges credits; changing any item runs as a new, separately " +
-        "charged batch. When a replay happens, the result text starts with a \"Replayed: ...\" line so you can " +
-        "tell it apart from a freshly computed result.",
+        "single clean or dirty result. This call sends an Idempotency-Key derived from every argument here plus " +
+        "this session, so retrying this exact same batch in this same session never re-charges credits; the " +
+        "identical batch from a different session is never treated as a replay of this one, and changing any item " +
+        "here also runs as a new, separately charged batch. When a replay happens, the result text starts with a " +
+        "\"Replayed: ...\" line so you can tell it apart from a freshly computed result. Set fresh true to force a " +
+        "re-run, see the fresh argument.",
       inputSchema: {
         items: z
           .array(
@@ -1065,10 +1146,11 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .enum(["person", "company"])
           .optional()
           .describe("Default entityType applied to any item above that does not specify its own."),
+        fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { items, purpose, entityType } = args as any;
+      const { items, purpose, entityType, fresh } = args as any;
       const body: Record<string, unknown> = { items, purpose };
       if (entityType !== undefined) body.entityType = entityType;
 
@@ -1077,7 +1159,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         path: "party/screen/batch",
         body,
         timeoutMs: LONG_TIMEOUT_MS,
-        idempotencyKey: computeIdempotencyKey("screen_party_litigation_batch", args),
+        idempotencyKey: computeIdempotencyKey(
+          "screen_party_litigation_batch",
+          body,
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
