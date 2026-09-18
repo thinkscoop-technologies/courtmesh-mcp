@@ -1,0 +1,66 @@
+# Changelog
+
+All notable changes to `@courtmesh/mcp-server` are documented here.
+
+## 0.3.0
+
+Aligned the server with the current CourtMesh public API contract (`api-v1-validations.ts`,
+`api-v1-prod.ts`, `party-screen-service.ts`, `api-tiers.ts`, `rate-limiter.ts`) and closed several
+stale or incomplete tool descriptions.
+
+### Added
+
+- `search_indian_court_cases`: new `cursor` input, the opaque signed pagination cursor. Documented
+  it as the current mechanism, with the raw `searchAfter` array kept only for callers on a server
+  with the self serve API tiers feature off. `limit` now documents the Free tier's 20 result page
+  size cap and the `PAGE_LIMIT_EXCEEDED` / `PAGINATION_DEPTH_EXCEEDED` 400 codes.
+- `semantic_search_cases`: exposed the real top level filters the API accepts (`court`, `year`,
+  `caseType`, `judgeName` and its aliases `judges`/`judge` as a single value, `caseNumber` as
+  digits only, `fromDate`, `toDate`), mapped onto the vector store's filter keys and echoed back in
+  `meta.appliedFilters`, alongside the existing nested `filters` object.
+- `request_case_timeline`: new `refresh` boolean input. Default false is a stored read (1 credit,
+  `meta.liveFetch: false`); `refresh: true` forces a live court fetch (20 credits, PAYG tier or
+  above, HTTP 403 `LIVE_FETCH_NOT_ALLOWED` on Free, HTTP 429 `LIVE_FETCH_LIMIT_REACHED` once the
+  tier's daily cap is exhausted). Timeout raised to 240 seconds for the live path.
+- `analyze_case`: new `allowRemoteFetch` boolean input. Required before the server will fetch a
+  case's source document from a remote court host; without it, a case needing a remote fetch
+  returns HTTP 403 `REMOTE_FETCH_NOT_ALLOWED`. Adds a 20 credit surcharge on top of the base 100
+  when a remote fetch actually happens.
+- `get_case_pdf_url`: documented the two distinct 404s, `CASE_NOT_FOUND` (no such case) versus
+  `PDF_NOT_STORED` (case exists, no stored document, with a `hint` pointing at
+  `request_case_timeline` with `refresh: true`).
+- `client.ts`: a single bounded retry for idempotent GET calls that fail with a `RATE_LIMITED` 429,
+  honouring the response's `Retry-After` header (or the body's `retryAfter`), capped at 60 seconds.
+  POST is never retried. Error messages now surface `requestId` from an error body when present.
+  Per code guidance text added for `REMOTE_FETCH_NOT_ALLOWED`, `LIVE_FETCH_NOT_ALLOWED`,
+  `SEMANTIC_NOT_ALLOWED`, `DISTINCT_CASES_LIMIT_REACHED`, `TOO_MANY_KEYS_FROM_IP`,
+  `CURSOR_INVALID`, `PAGE_LIMIT_EXCEEDED` and `PAGINATION_DEPTH_EXCEEDED`.
+
+### Changed
+
+- `screen_party_litigation`: `limit` now caps at 100 (`.max(100)`), `displayThreshold` is bounded
+  to `.min(0).max(1)`, `knownPersons` caps at 10 entries, and `court` accepts a single court name
+  string or a one element array (a second court is rejected with a 400 instead of silently used).
+  Description rewritten to state that Free tier `adjudicate: true` is a hard HTTP 403
+  `API_TIER_NOT_ALLOWED` block, not a silent no-op; that the response's top level `notice` field
+  (there is no `coverage.note`) carries the case removal policy text; the full verdict rules
+  (`since` always forces `inconclusive`; a withheld record with nothing else surviving forces
+  `inconclusive`; `matchCount` can read 0 while `verdict` still reads `matches_found` when
+  `displayThreshold` hides everything); and that the 80 credit adjudicate surcharge is billed only
+  when `adjudicationsRun > 0`. Also notes the Free tier has no `semantic_search_cases` access
+  (403 `SEMANTIC_NOT_ALLOWED`) and no live timeline fetches.
+- `client.ts`: `LONG_TIMEOUT_MS` default raised from 600s to 630s, so the client's own timeout does
+  not race the server's slowest documented internal deadline. Fixed `CURSOR_INVALID` (a 400 body
+  with no `error` field) being misreported as the unrelated tier page size cap shape.
+
+### Removed
+
+- Deleted stale caveats that no longer match the server: `semantic_search_cases` no longer claims
+  its top level filter fields are silently ignored (they are now real filters, see Added above),
+  and the README no longer describes `POST /search/cases/semantic` as flushing an HTTP 200 before
+  finishing work (that early-flush behaviour was removed server side; a failure now arrives with
+  its real status code).
+
+## 0.2.0 and earlier
+
+See git history.

@@ -11,7 +11,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, request } from "./client.js";
+import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, TIMELINE_TIMEOUT_MS, request } from "./client.js";
 import { getApiKeyOverride } from "./context.js";
 
 export interface ToolServerOptions {
@@ -40,8 +40,14 @@ function paginationNote(pagination: any): string | undefined {
   if (pagination.totalPages !== undefined) parts.push(`of ${pagination.totalPages} pages`);
   if (pagination.total !== undefined) parts.push(`${pagination.total} total results`);
   if (pagination.hasMore) parts.push("more results are available");
-  if (pagination.nextCursor !== undefined) {
-    parts.push(`nextCursor for searchAfter on the next call: ${JSON.stringify(pagination.nextCursor)}`);
+  // nextCursor is null, not merely absent, when there is no further page - this used to check
+  // only !== undefined, so a null cursor was advertised to the calling model as something to
+  // pass back on the next call. Its shape also depends on the server's self serve tiers flag:
+  // an opaque signed string (pass back as `cursor`) when the flag is on, or the legacy raw
+  // OpenSearch sort tuple array (pass back as `searchAfter`) when it is off. Either way, this
+  // note just surfaces the value; the tool description tells the caller which field to use.
+  if (pagination.nextCursor !== undefined && pagination.nextCursor !== null) {
+    parts.push(`next page cursor, pass back as cursor (or searchAfter if it is an array): ${JSON.stringify(pagination.nextCursor)}`);
   }
   return parts.length > 0 ? `Pagination: ${parts.join(", ")}.` : undefined;
 }
@@ -112,10 +118,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Fast, exact match, does not consume AI credits. Prefer this over semantic_search_cases for case numbers, " +
         "party names, citations, judge names and exact phrases. Use semantic_search_cases instead when the request " +
         "is a natural language question about legal concepts, doctrines or fact patterns rather than exact terms. " +
-        "Note: the caseNumber field is accepted and echoed back but does not actually filter results, put case " +
-        "number text in query instead. Note: sortBy only accepts relevance or date at the validation layer, but " +
-        "the underlying search engine only understands relevance, recent or oldest internally, so date is accepted " +
-        "yet may not reorder results as expected.",
+        "Note: caseNumber does filter results (a single value; if an array is sent only the first element is " +
+        "used). Note: sortBy is honoured: relevance, recent and oldest are all real sort orders. date is accepted " +
+        "as a deprecated alias for recent, and the response's meta carries a notice explaining the substitution; " +
+        "prefer sending recent or oldest directly.",
       inputSchema: {
         query: z.string().trim().min(1).describe("Search text: keywords, a phrase, a case number, or a party name."),
         court: stringOrArray("Court name or list of court names to filter by."),
@@ -125,8 +131,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .describe("Year or list of years, each 1947 to the current year, as an integer or a 4 digit string."),
         caseType: stringOrArray("Case type or list of case types to filter by."),
         caseNumber: stringOrArray(
-          "Case number or list of case numbers. Accepted and echoed back in the response meta.filters, but this " +
-            "does not actually filter results in the current API. Put the case number in query instead."
+          "Case number to filter by. The server filters on a single case number string; if a list is passed here, " +
+            "only the first element is actually used. The applied value is echoed back in the response meta.filters."
         ),
         judgeName: stringOrArray(
           "Judge name or list of judge names to filter by. Aliases judges and judge are also accepted; if more " +
@@ -138,25 +144,49 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD").optional().describe("Start date, inclusive, YYYY-MM-DD."),
         toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD").optional().describe("End date, inclusive, YYYY-MM-DD."),
         page: z.number().int().min(1).optional().describe("Page number, default 1."),
-        limit: z.number().int().min(1).max(100).optional().describe("Results per page, 1 to 100, default 20."),
-        sortBy: z
-          .enum(["relevance", "date"])
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
           .optional()
           .describe(
-            "Sort order, default relevance. Only relevance and date pass validation here; see the tool " +
-              "description for a real behaviour caveat about date."
+            "Results per page, 1 to 100, default 20. Each tier caps this lower: the Free tier's page size cap is " +
+              "20. Sending a limit above the caller's tier cap is rejected with HTTP 400 PAGE_LIMIT_EXCEEDED, and " +
+              "a page times limit depth beyond the tier's pagination depth cap is rejected with HTTP 400 " +
+              "PAGINATION_DEPTH_EXCEEDED; both responses carry the tier and the limit actually allowed."
+          ),
+        sortBy: z
+          .enum(["relevance", "recent", "oldest", "date"])
+          .optional()
+          .describe(
+            "Sort order, default relevance. relevance, recent and oldest are all honoured by the search engine. " +
+              "date is accepted too, as a deprecated alias that is applied as recent; prefer recent or oldest."
+          ),
+        cursor: z
+          .string()
+          .trim()
+          .optional()
+          .describe(
+            "Opaque signed pagination cursor. Pass back the pagination.nextCursor string from a previous " +
+              "response, unmodified, to fetch the next page; it is bound to the exact query and filters it was " +
+              "issued for, so changing any of those and reusing an old cursor, or hand editing it, fails with HTTP " +
+              "400 CURSOR_INVALID, at which point start the search again without a cursor. Prefer this over page " +
+              "for paging beyond the first few thousand results. This is the current mechanism; searchAfter below " +
+              "is the older one, honoured only while the server's self serve API tiers feature is off."
           ),
         searchAfter: z
           .string()
           .optional()
           .describe(
-            "Deep pagination cursor. Pass back the JSON encoded pagination.nextCursor array from a previous " +
-              "response. Prefer this over page for paging beyond the first few thousand results."
+            "Legacy deep pagination cursor, honoured only while the server's self serve API tiers feature is off " +
+              "(prefer cursor above otherwise, which replaces this). Pass back the JSON encoded " +
+              "pagination.nextCursor array from a previous response."
           ),
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { query, court, year, caseType, caseNumber, judgeName, judges, judge, fromDate, toDate, page, limit, sortBy, searchAfter } =
+      const { query, court, year, caseType, caseNumber, judgeName, judges, judge, fromDate, toDate, page, limit, sortBy, cursor, searchAfter } =
         args as any;
       const body: Record<string, unknown> = { query };
       if (court !== undefined) body.court = court;
@@ -170,6 +200,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       if (page !== undefined) body.page = page;
       if (limit !== undefined) body.limit = limit;
       if (sortBy !== undefined) body.sortBy = sortBy;
+      if (cursor !== undefined) body.cursor = cursor;
       if (searchAfter !== undefined) body.searchAfter = searchAfter;
 
       const result = await callApi(opts, { method: "POST", path: "search/cases", body, timeoutMs: DEFAULT_TIMEOUT_MS });
@@ -179,6 +210,19 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
   );
 
   // 2. semantic_search_cases ----------------------------------------------
+  const semanticJudgeParam = z
+    .union([
+      z.string().trim().min(1),
+      z.array(z.string().trim().min(1)).max(1, "only one judge name is honoured per semantic search request"),
+    ])
+    .optional()
+    .describe(
+      "Judge name to filter by: a single value, or a one element array of the same. The vector index matches " +
+        "one judge name per request; a second value is rejected with a 400. Aliases judges and judge are also " +
+        "accepted, in that order of precedence. Use search_indian_court_cases for more than one judge, or to " +
+        "get the exact spelling via search_judges first."
+    );
+
   server.registerTool(
     "semantic_search_cases",
     {
@@ -187,30 +231,67 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "AI vector search over the roughly 2M case subset that has embeddings, out of the full 310M plus corpus. " +
         "CONSUMES AI CREDITS. Prefer this over search_indian_court_cases for natural language questions about " +
         "legal concepts, fact patterns or doctrines, where exact keywords will not match. Slower, a single call " +
-        "can take a minute or more. Real behaviour note: this endpoint's validation layer also accepts top level " +
-        "court, year, caseType, caseNumber, judgeName, judges, judge, fromDate and toDate fields, but the handler " +
-        "silently ignores all of them, only query, page, limit and filters are actually used, so this tool only " +
-        "exposes those. Put any filtering inside the filters object instead. Another quirk: if the cleaned query " +
-        "text ends up shorter than 3 characters after internal processing, the service falls back to a plain " +
-        "keyword search and marks the response with meta.fallbackMode = \"opensearch\".",
+        "can take a minute or more. Top level court, year, caseType, judgeName (and aliases judges, judge), " +
+        "caseNumber, fromDate and toDate are all real filters here: each is mapped onto the vector store's own " +
+        "filter keys and echoed back in meta.appliedFilters, alongside whatever the service auto extracted from " +
+        "the query text. The nested filters object below addresses the vector store's own keys directly (court, " +
+        "caseType, caseYear, judgeName, caseNumber, decisionDate.$gte/$lte) and takes precedence over the top " +
+        "level fields and over auto extraction when the same key is set in more than one place. caseNumber here " +
+        "must be digits only (the vector index filters case numbers numerically); use search_indian_court_cases " +
+        "for a formatted case number string. Free tier note: this endpoint returns HTTP 403 SEMANTIC_NOT_ALLOWED " +
+        "on the Free tier, which has no semantic search access at all, only keyword search via " +
+        "search_indian_court_cases. Another quirk: if the cleaned query text ends up shorter than 3 characters " +
+        "after internal processing, the service falls back to a plain keyword search and marks the response " +
+        "with meta.fallbackMode = \"opensearch\".",
       inputSchema: {
         query: z.string().trim().min(3).describe("Natural language question or description, minimum 3 characters."),
+        court: stringOrArray("Court name or list of court names to filter by."),
+        year: z
+          .union([yearValue, z.array(yearValue)])
+          .optional()
+          .describe("Year or list of years, each 1947 to the current year, as an integer or a 4 digit string."),
+        caseType: stringOrArray("Case type or list of case types to filter by."),
+        caseNumber: z
+          .union([
+            z.string().trim().regex(/^\d+$/, 'must be digits only, e.g. "1234"'),
+            z.array(z.string().trim().regex(/^\d+$/, 'must be digits only, e.g. "1234"')),
+          ])
+          .optional()
+          .describe(
+            "Case number filter, digits only (e.g. \"1234\"), because the vector index filters case numbers " +
+              "numerically and cannot match a formatted string like \"WP(C) 123/2024\". Use search_indian_court_cases " +
+              "to filter on a full formatted case number."
+          ),
+        judgeName: semanticJudgeParam,
+        judges: semanticJudgeParam,
+        judge: semanticJudgeParam,
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD").optional().describe("Start date, inclusive, YYYY-MM-DD."),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD").optional().describe("End date, inclusive, YYYY-MM-DD."),
         page: z.number().int().min(1).optional().describe("Page number, default 1."),
         limit: z.number().int().min(1).max(100).optional().describe("Results per page, 1 to 100, default 20, clamped to 100 server side."),
         filters: z
           .record(z.string(), z.unknown())
           .optional()
           .describe(
-            "Free form filter object passed straight through to the vector store. Keys the handler actually " +
-              "understands downstream: court, caseType, caseYear, judgeName, caseNumber, and decisionDate as an " +
-              "object with $gte and or $lte sub keys for range filtering. Filters supplied here override whatever " +
-              "filters the service would otherwise auto extract from the query text."
+            "Free form filter object passed straight through to the vector store, addressing its own keys " +
+              "directly: court, caseType, caseYear, judgeName, caseNumber, and decisionDate as an object with " +
+              "$gte and or $lte sub keys for range filtering. Takes precedence over the top level court/year/" +
+              "caseType/judgeName/caseNumber/fromDate/toDate fields above and over auto extraction from the " +
+              "query text when the same key is set in more than one place."
           ),
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { query, page, limit, filters } = args as any;
+      const { query, court, year, caseType, caseNumber, judgeName, judges, judge, fromDate, toDate, page, limit, filters } = args as any;
       const body: Record<string, unknown> = { query };
+      if (court !== undefined) body.court = court;
+      if (year !== undefined) body.year = year;
+      if (caseType !== undefined) body.caseType = caseType;
+      if (caseNumber !== undefined) body.caseNumber = caseNumber;
+      const judgeValue = judgeName ?? judges ?? judge;
+      if (judgeValue !== undefined) body.judgeName = judgeValue;
+      if (fromDate !== undefined) body.fromDate = fromDate;
+      if (toDate !== undefined) body.toDate = toDate;
       if (page !== undefined) body.page = page;
       if (limit !== undefined) body.limit = limit;
       if (filters !== undefined) body.filters = filters;
@@ -260,7 +341,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "issues, courtsReasoning, citedCases (followed, distinguished, overruled, referred), " +
         "precedentRelationships, arguments (petitioner, respondent), practiceAreas, subCategories, tags, " +
         "procedureType, precedentValue, legalPrinciples, doctrinesApplied, statutoryInterpretation and " +
-        "constitutionalProvisions. Fields with no value are omitted from the response.",
+        "constitutionalProvisions. Fields with no value are omitted from the response. Free tier note: this read " +
+        "returns HTTP 403 API_TIER_NOT_ALLOWED with an upgrade URL on the free tier, same as analyze_case; the " +
+        "free tier has no access to AI analysis in any form.",
       inputSchema: { id: idParam },
     },
     async (args): Promise<CallToolResult> => {
@@ -322,21 +405,39 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     {
       title: "Analyze Case",
       description:
-        "Triggers AI analysis of a single case. CONSUMES AI CREDITS. ASYNCHRONOUS: normally returns immediately " +
-        "with status processing while the analysis runs in the background; poll get_case_analysis after roughly " +
-        "30 to 60 seconds to retrieve the result. If analysis already exists and force is not set, the existing " +
-        "analysis is returned immediately instead with alreadyExists true. Set force true to re-analyze a case " +
-        "that already has analysis, which also consumes credits again. Fails with a clear message if the case has " +
-        "no usable text or PDF content to analyze.",
+        "Triggers AI analysis of a single case. CONSUMES 100 AI CREDITS per call, plus a further 20 credit " +
+        "surcharge when the source document has to be fetched from a remote court host rather than served from " +
+        "stored data (see allowRemoteFetch). ASYNCHRONOUS: normally returns immediately with status processing " +
+        "while the analysis runs in the background; poll get_case_analysis after roughly 30 to 60 seconds to " +
+        "retrieve the result. If analysis already exists and force is not set, the existing analysis is returned " +
+        "immediately instead with alreadyExists true, at no extra charge. Set force true to re-analyze a case " +
+        "that already has analysis, which also consumes credits again. Fails with a clear message if the case " +
+        "has no usable text or PDF content to analyze. Free tier note: this tool, analyze_consolidated_case, and " +
+        "reading analysis on the free tier all return HTTP 403 API_TIER_NOT_ALLOWED with an upgrade URL; the " +
+        "free tier gets no AI analysis at all, only keyword search, case detail, related cases, judges, PDF, " +
+        "semantic search and a limited party/screen allowance.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run analysis even if it already exists, default false."),
+        allowRemoteFetch: z
+          .boolean()
+          .optional()
+          .describe(
+            "Set true to allow fetching the case's source document from a remote court host (only ecourts.gov.in, " +
+              "nic.in, sci.gov.in, gov.in and courtmesh.ai hosts are ever eligible) when it is not already " +
+              "available as stored text or an S3 document. Default false. Without it, a case that needs a remote " +
+              "fetch to be analyzed returns HTTP 403 REMOTE_FETCH_NOT_ALLOWED instead of running (this is a " +
+              "one time consent per call, not a standing setting); when it is used and a remote fetch actually " +
+              "happens, a 20 credit surcharge is added on top of the base analyze price. Not available on the " +
+              "Free tier, which returns 403 REMOTE_FETCH_NOT_ALLOWED regardless of this flag."
+          ),
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { id, force } = args as any;
+      const { id, force, allowRemoteFetch } = args as any;
       const body: Record<string, unknown> = {};
       if (force !== undefined) body.force = force;
+      if (allowRemoteFetch !== undefined) body.allowRemoteFetch = allowRemoteFetch;
       const result = await callApi(opts, {
         method: "POST",
         path: `cases/${encodeURIComponent(id)}/analyze`,
@@ -360,7 +461,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Court case it analyzes the case document plus up to 5 most recent orders. For a Supreme Court case it " +
         "analyzes up to 20 documents sharing the case number. Set force true to redo analysis that already " +
         "exists, at the cost of credits again. Fails if the case has no case number or no text content, or if AI " +
-        "credits are exhausted.",
+        "credits are exhausted. Free tier note: this tool returns HTTP 403 API_TIER_NOT_ALLOWED with an upgrade " +
+        "URL on the free tier, same as analyze_case; the free tier has no access to AI analysis in any form.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run consolidated analysis even if it already exists, default false."),
@@ -391,8 +493,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "the returned pdfUrl is an ENCRYPTED presigned S3 URL, not a directly fetchable link, it must be " +
         "decrypted with a case specific key before use, and it expires after the returned expiresIn seconds " +
         "(normally 3600). Do not attempt to fetch pdfUrl directly, treat it as an opaque token to hand back to " +
-        "the user or to a CourtMesh client that knows how to decrypt it. Returns 404 if the case has no stored " +
-        "document.",
+        "the user or to a CourtMesh client that knows how to decrypt it. Two distinct 404s: code CASE_NOT_FOUND " +
+        "means no case matches the given id at all; code PDF_NOT_STORED means the case exists but has no stored " +
+        "document, and comes with a hint field suggesting request_case_timeline with refresh:true, which can " +
+        "fetch orders for High Court and District Court cases (tribunal documents are not fetchable via this API).",
       inputSchema: { id: idParam },
     },
     async (args): Promise<CallToolResult> => {
@@ -409,27 +513,43 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     {
       title: "Request Case Timeline",
       description:
-        "Kicks off a fetch of the live order and hearing history for a case directly from the court's own " +
-        "systems. Asynchronous job, no AI credits consumed. case_id must be the 24 character MongoDB ObjectId " +
-        "string, the id field from search results, a case number will fail. Supreme Court cases return " +
-        "immediately with status completed and orderCount 0, since SC cases have no separate order history in " +
-        "this system. District Court cases are fetched synchronously and come back completed or failed. High " +
-        "Court cases usually return pending and must be polled with get_case_timeline using the returned " +
-        "requestId.",
+        "Reads or refreshes the order and hearing history for a case. No AI credits consumed. case_id must be " +
+        "the 24 character MongoDB ObjectId string, the id field from search results, a case number will fail. " +
+        "By default (refresh omitted or false) this is a STORED read: 1 credit, meta.liveFetch is false, and it " +
+        "never contacts a court portal. Set refresh true to force a LIVE fetch directly from the court's own " +
+        "systems instead: 20 credits, meta.liveFetch true, available on PAYG and above only (Free tier returns " +
+        "HTTP 403 LIVE_FETCH_NOT_ALLOWED), and subject to a per tier daily cap (HTTP 429 " +
+        "LIVE_FETCH_LIMIT_REACHED once exhausted, with a Retry-After telling you when it resets). Supreme Court " +
+        "cases return immediately with status completed and orderCount 0, since SC cases have no separate order " +
+        "history in this system. District Court cases are fetched synchronously and come back completed or " +
+        "failed. High Court cases usually return pending and must be polled with get_case_timeline using the " +
+        "returned requestId. A live refresh can take a while against a slow court portal, so this call uses a " +
+        "longer timeout than most tools.",
       inputSchema: {
         case_id: z
           .string()
           .min(1)
           .describe("24 character MongoDB ObjectId string for the case, from the id field of a search result. A case number will not work here."),
+        refresh: z
+          .boolean()
+          .optional()
+          .describe(
+            "Default false: a stored-only read, 1 credit, meta.liveFetch false, never touches a court portal. " +
+              "Set true to force a live fetch from the court's own systems: 20 credits, meta.liveFetch true, " +
+              "PAYG tier or above only (403 LIVE_FETCH_NOT_ALLOWED on Free), and capped per day per tier (429 " +
+              "LIVE_FETCH_LIMIT_REACHED once exhausted)."
+          ),
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { case_id } = args as any;
+      const { case_id, refresh } = args as any;
+      const body: Record<string, unknown> = { case_id };
+      if (refresh !== undefined) body.refresh = refresh;
       const result = await callApi(opts, {
         method: "POST",
         path: "request-timeline",
-        body: { case_id },
-        timeoutMs: DEFAULT_TIMEOUT_MS,
+        body,
+        timeoutMs: TIMELINE_TIMEOUT_MS,
       });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
@@ -476,4 +596,224 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       return textResult(result.data);
     }
   );
+
+  // 13. screen_party_litigation ---------------------------------------------
+  server.registerTool(
+    "screen_party_litigation",
+    {
+      title: "Screen Party Litigation",
+      description:
+        "Litigation check for one person or company name against the full case corpus: KYC, background " +
+        "verification, due diligence, counterparty and litigation screening. CONSUMES AI CREDITS: 100 credits if " +
+        "the screen finds any matches, 20 credits if it finds none, plus a further 80 credit surcharge if " +
+        "adjudicate is set true. purpose is REQUIRED and is not decorative: it is recorded under DPDP as the " +
+        "lawful basis for processing this name, so pick the value that actually describes why this screen is " +
+        "being run (kyc, bgv, due_diligence, litigation, research, compliance), never a placeholder. " +
+        "IMPORTANT ABOUT WHAT A MATCH MEANS: a match is a case record whose party text matches the given name and " +
+        "identifiers to some confidence band, it is NOT a verified statement that this specific real world person " +
+        "or company is a litigant. Common names, aliases and identical entity names across different individuals " +
+        "or companies all produce matches; always read confidence.band, evidence.matchedFields and " +
+        "evidence.disambiguatorPresent before treating a match as identity-confirmed, and prefer matches with an " +
+        "identifier (PAN, GSTIN, CIN, LLPIN) or address corroboration over name-only matches, especially for " +
+        "common person names. summary.verdict is one of matches_found, no_matches_found or inconclusive, and its " +
+        "rules are stricter than they look: no_matches_found is only ever returned when coverage.exhaustive is " +
+        "true (every available search strategy actually ran to completion) AND nothing was withheld; sending " +
+        "since always forces inconclusive too, because it is a best effort post filter that cannot certify " +
+        "completeness in either direction; and a withheld record (a restricted case, an unverifiable id, a masked " +
+        "title) with no other surviving match also forces inconclusive rather than a clean negative. Conversely, " +
+        "summary.matchCount (the size of the displayed matches array) can read 0 while verdict still reads " +
+        "matches_found, when every internally matching candidate was filtered out of the display by " +
+        "displayThreshold - verdict describes what was found, matchCount/matches describe what is shown at your " +
+        "threshold, and only the former should be treated as authoritative for \"was anything found\". Report an " +
+        "inconclusive or partial screen as exactly that, never as a clean record. The response's top level notice " +
+        "field (not coverage.note, which does not exist) carries the case removal / right-to-be-forgotten policy " +
+        "text; always surface it plus coverage.someRecordsWithheld to the end user rather than silently treating " +
+        "an inconclusive or partial screen as a clearance. adjudicate (default false) turns on an LLM " +
+        "disambiguation pass over the uncertain middle of the candidates for a more confident band; identifiers " +
+        "are never sent to the adjudication model. The +80 credit surcharge for adjudicate is charged only when " +
+        "adjudicationsRun is actually greater than 0 in the response - every candidate can already have been " +
+        "decisive (an exact identifier match, or too dissimilar to bother), in which case no model call happens " +
+        "and no surcharge is billed even though adjudicate was true. Free tier: 10 screens per month, and " +
+        "adjudicate:true is a HARD BLOCK there, not a silent ignore - it returns HTTP 403 API_TIER_NOT_ALLOWED " +
+        "before any screening runs at all, so do not set adjudicate true for a Free tier caller. The Free tier " +
+        "also has no semantic_search_cases access (403 SEMANTIC_NOT_ALLOWED) and no live court/timeline fetches " +
+        "(request_case_timeline's refresh:true needs PAYG or above), so a Free tier litigation check is keyword " +
+        "search plus deterministic party screening only. This is a records search, not a legal or compliance " +
+        "opinion; casePageUrl in each match links to the public case page.",
+      inputSchema: {
+        name: z
+          .string()
+          .trim()
+          .min(2)
+          .max(200)
+          .describe("Full name to screen: a person's name or a company/entity name, 2 to 200 characters."),
+        aliases: z
+          .array(z.string().trim().min(1))
+          .max(7)
+          .optional()
+          .describe("Up to 7 alternate spellings or former names for the same person or entity, screened alongside name."),
+        entityType: z
+          .enum(["person", "company"])
+          .describe("Whether name refers to an individual (person) or an organization (company)."),
+        purpose: z
+          .enum(["kyc", "bgv", "due_diligence", "litigation", "research", "compliance"])
+          .describe(
+            "REQUIRED. The DPDP lawful basis for this screen: kyc (know your customer), bgv (background " +
+              "verification, typically employment), due_diligence (commercial/transaction diligence), litigation " +
+              "(active or prospective dispute), research (non-decisional legal research), or compliance " +
+              "(regulatory/AML/sanctions style checks). This is recorded against the request, so choose the value " +
+              "that genuinely describes why the name is being screened."
+          ),
+        identifiers: z
+          .object({
+            pan: z.string().trim().optional().describe("Income tax PAN, for a person or company."),
+            gstin: z.string().trim().optional().describe("GST identification number, for a company."),
+            cin: z.string().trim().optional().describe("Corporate Identification Number, for a company."),
+            llpin: z.string().trim().optional().describe("LLP Identification Number, for an LLP."),
+          })
+          .optional()
+          .describe(
+            "Government identifiers, when known. Strongly recommended for company/entity screens and for common " +
+              "person names: an identifier match is much stronger evidence than a name-only match and materially " +
+              "improves confidence banding. Never sent to the adjudication model even when adjudicate is true."
+          ),
+        address: z
+          .object({
+            city: z.string().trim().optional(),
+            state: z.string().trim().optional(),
+            stateCode: z.string().trim().optional().describe("State code, for example MH, DL, KA."),
+          })
+          .optional()
+          .describe("Known address details, used as a disambiguating signal alongside name and identifiers."),
+        knownPersons: z
+          .array(z.string().trim().min(1))
+          .max(10, "knownPersons can hold at most 10 entries")
+          .optional()
+          .describe(
+            "Names of directors, partners, family members or known associates, used to help disambiguate between " +
+              "same-named parties in different case records. Up to 10 entries."
+          ),
+        court: z
+          .union([z.string().trim(), z.array(z.string().trim()).max(1, "one court per request for now")])
+          .optional()
+          .describe(
+            "Restrict the screen to a single court: a court name string, or a one element array of the same. " +
+              "Only one court is ever honoured; a multi element array is rejected with a 400 rather than silently " +
+              "narrowed to its first entry."
+          ),
+        since: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD")
+          .optional()
+          .describe(
+            "Only consider cases filed or decided on or after this date, YYYY-MM-DD. This is a best effort post " +
+              "filter, not a guarantee of completeness in either direction, so using it at all forces " +
+              "summary.verdict to inconclusive - see the tool description."
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100, "limit cannot exceed 100")
+          .optional()
+          .describe("Maximum number of matches to return, 1 to 100, default 40."),
+        adjudicate: z
+          .boolean()
+          .optional()
+          .describe(
+            "Run an LLM adjudication pass over the uncertain middle of the candidates for sharper confidence " +
+              "banding. Default false. A +80 credit surcharge applies, but only when the response's " +
+              "adjudicationsRun is actually greater than 0 (some candidates may already be decisive and need no " +
+              "model call). NOT AVAILABLE on the Free tier: setting this true there is a hard block, HTTP 403 " +
+              "API_TIER_NOT_ALLOWED, before any screening runs, not a silent no-op."
+          ),
+        displayThreshold: z
+          .number()
+          .min(0, "displayThreshold must be between 0 and 1")
+          .max(1, "displayThreshold must be between 0 and 1")
+          .optional()
+          .describe(
+            "Minimum confidence score, 0 to 1, for a candidate to be included in the displayed matches array. A " +
+              "Confirmed band candidate is always shown regardless of this value. Candidates this excludes are " +
+              "simply left out of matches, not moved into relatedButUnverified (which is a separate, unrelated set " +
+              "of same-case-number documents the search engine could not itself verify as a match at all). Raising " +
+              "this can make matches empty (matchCount 0) even though summary.verdict still reads matches_found - " +
+              "see the tool description. Omit to use the service default (0.6)."
+          ),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const {
+        name,
+        aliases,
+        entityType,
+        purpose,
+        identifiers,
+        address,
+        knownPersons,
+        court,
+        since,
+        limit,
+        adjudicate,
+        displayThreshold,
+      } = args as any;
+      const body: Record<string, unknown> = { name, entityType, purpose };
+      if (aliases !== undefined) body.aliases = aliases;
+      if (identifiers !== undefined) body.identifiers = identifiers;
+      if (address !== undefined) body.address = address;
+      if (knownPersons !== undefined) body.knownPersons = knownPersons;
+      if (court !== undefined) body.court = court;
+      if (since !== undefined) body.since = since;
+      if (limit !== undefined) body.limit = limit;
+      if (adjudicate !== undefined) body.adjudicate = adjudicate;
+      if (displayThreshold !== undefined) body.displayThreshold = displayThreshold;
+
+      const result = await callApi(opts, {
+        method: "POST",
+        path: "party/screen",
+        body,
+        timeoutMs: LONG_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 14. get_court_coverage ---------------------------------------------------
+  server.registerTool(
+    "get_court_coverage",
+    {
+      title: "Get Court Coverage",
+      description:
+        "Reads the current corpus coverage and freshness snapshot: total records, the document-bearing versus " +
+        "status-only split, a breakdown by court type and by year, per-court figures, and a rolled up District " +
+        "Court row. No authentication required and no AI credits consumed. The response is cached for several " +
+        "hours server side (see meta.cacheTtlSeconds), so treat generatedAt as the figure's as-of time rather than " +
+        "expecting a live count on every call. Useful before or alongside screen_party_litigation to explain what " +
+        "a no_matches_found or inconclusive verdict is measured against, and to answer general questions about how " +
+        "much of the Indian court system this API actually covers.",
+      inputSchema: {},
+    },
+    async (): Promise<CallToolResult> => {
+      const result = await callApi(opts, { method: "GET", path: "coverage" });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Deliberately NOT implemented here: watchlist and webhook tools.
+  //
+  // The backend plan (Phase M2) adds POST/GET/DELETE watchlist endpoints and
+  // webhook subscription management on top of party/screen. Both are stateful
+  // (they create and own server side resources tied to the caller's account)
+  // and billable (watchlist events and webhook deliveries carry their own
+  // credit cost once shipped). An MCP tool call is a one-shot, fire-and-forget
+  // action with no confirmation step and no per-call cost visible to the
+  // calling model ahead of time, which is the wrong shape for "create a
+  // standing subscription that keeps charging me" or "register a URL that
+  // will receive my data going forward". Add these only once M2 ships, and
+  // only with an explicit confirmation/cost-preview step, not as a plain
+  // registerTool alongside the read-only and single-shot tools above.
+  // ---------------------------------------------------------------------------
 }
