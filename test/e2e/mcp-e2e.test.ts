@@ -525,6 +525,48 @@ test("stdio: search_indian_court_cases (a non idempotency-key endpoint) sends no
   assert.equal(req!.headers["idempotency-key"], undefined);
 });
 
+// ---------------------------------------------------------------------------
+// Idempotency-Key REPLAY: QA_LIVE_MCP_AUTH_2026-09-19.md finding 3. The server marks a replayed
+// response with an `Idempotency-Replayed: true` header (simulated by the mock's idempotency
+// store); client.ts must turn that into a `replayed: true` field on the parsed body, and the five
+// idempotency-key tools must turn that into a leading "Replayed: ..." line in the tool result
+// text, not just the pre-existing (and easy to miss) query redaction.
+// ---------------------------------------------------------------------------
+
+test("stdio: screen_party_litigation's result text starts with a Replayed line only on the replay, not the first call", async () => {
+  const args = { name: "Priya Replay QA Test", entityType: "person" as const, purpose: "compliance" as const };
+
+  const first = await stdioMain.client.callTool({ name: "screen_party_litigation", arguments: args });
+  assert.notEqual((first as any).isError, true);
+  const firstText = resultText(first);
+  assert.ok(!firstText.startsWith("Replayed:"), "a fresh call must not claim to be a replay");
+
+  const second = await stdioMain.client.callTool({ name: "screen_party_litigation", arguments: args });
+  assert.notEqual((second as any).isError, true);
+  const secondText = resultText(second);
+  assert.ok(
+    secondText.startsWith("Replayed: identical request served from the 24 hour idempotency cache, no credits charged."),
+    `expected the replay to start with the Replayed line, got: ${secondText.slice(0, 200)}`
+  );
+  // The rest of the payload (matches, summary, etc.) is still the full result, not just the note.
+  assert.ok(secondText.includes("summary"));
+});
+
+test("stdio: request_case_timeline's result text starts with a Replayed line only on the replay, not the first call", async () => {
+  const args = { case_id: "64f1a2b3c4d5e6f7a8b9c0d2" }; // CASE_ANALYZED.id, not used by any earlier request_case_timeline call
+
+  const first = await stdioMain.client.callTool({ name: "request_case_timeline", arguments: args });
+  assert.notEqual((first as any).isError, true);
+  assert.ok(!resultText(first).startsWith("Replayed:"), "a fresh call must not claim to be a replay");
+
+  const second = await stdioMain.client.callTool({ name: "request_case_timeline", arguments: args });
+  assert.notEqual((second as any).isError, true);
+  assert.ok(
+    resultText(second).startsWith("Replayed: identical request served from the 24 hour idempotency cache, no credits charged."),
+    "expected the replay to start with the Replayed line"
+  );
+});
+
 test("stdio: get_court_coverage requires no API key and returns corpus totals", async () => {
   const result = await stdioMain.client.callTool({ name: "get_court_coverage", arguments: {} });
   const req = lastRequestMatching(/^\/coverage$/, "GET");
@@ -583,6 +625,22 @@ test("stdio: search_indian_court_cases forwards a supplied cursor verbatim", asy
   assert.ok(req);
   assert.equal(req!.body.cursor, "eyJzYSI6WyJtb2NrIl0.mocksignature");
   assert.notEqual((result as any).isError, true);
+});
+
+test("stdio: search_indian_court_cases backfills id from mongoId when the index hit has no id field", async () => {
+  // QA_LIVE_MCP_AUTH_2026-09-19.md finding 2: the real /search/cases index returns mongoId, not
+  // id, even though get_case/find_related_cases/get_case_pdf_url/request_case_timeline all
+  // document "the id field from search results". The mock's hits (see scenario in mock-api.mjs)
+  // deliberately carry only mongoId, matching the real API; backfillSearchHitIds in tools.ts must
+  // fill in id from it so that documented instruction is actually true.
+  const result = await stdioMain.client.callTool({
+    name: "search_indian_court_cases",
+    arguments: { query: "anticipatory bail section 438" },
+  });
+  assert.notEqual((result as any).isError, true);
+  const text = resultText(result);
+  assert.match(text, /"mongoId":\s*"64f1a2b3c4d5e6f7a8b9c0d1"/, "mongoId must still be present, unmodified");
+  assert.match(text, /"id":\s*"64f1a2b3c4d5e6f7a8b9c0d1"/, "id must be backfilled from mongoId");
 });
 
 test("stdio: semantic_search_cases forwards the top level filters as real filters, not dropped", async () => {
@@ -1084,7 +1142,7 @@ test("stdio: 400 tier-cap-exceeded is reported as a plan limit, not a generic va
   }
 });
 
-test("stdio: 503 is reported as a plain upstream failure", async () => {
+test("stdio: 503 is reported as a plain upstream failure, with its machine readable code", async () => {
   const handle = await withScenarioStdio(mock.KEYS.scenario503);
   try {
     const result = await handle.client.callTool({ name: "get_court_coverage", arguments: {} });
@@ -1092,6 +1150,11 @@ test("stdio: 503 is reported as a plain upstream failure", async () => {
     const text = resultText(result);
     assertNonLeaking(text, [mock.KEYS.scenario503]);
     assert.match(text, /503/);
+    // QA_LIVE_MCP_AUTH_2026-09-19.md finding 4: describeGenericError used to drop body.code for
+    // every 5xx/408 status, unlike the 400/403/404 describers. get_court_coverage's real 503 body
+    // carries code: "COVERAGE_NOT_READY" (see scenario503Body in mock-api.mjs); the tool text must
+    // surface it the same way describeForbiddenError/describeNotFoundError already do.
+    assert.match(text, /Code:\s*COVERAGE_NOT_READY/);
   } finally {
     await handle.close();
   }

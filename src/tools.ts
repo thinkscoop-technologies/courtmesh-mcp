@@ -87,13 +87,49 @@ async function callApi(
   }
 }
 
+/**
+ * The line every idempotency-key tool result starts with when the response was served from the
+ * server's 24 hour idempotency cache rather than freshly computed (client.ts sets `replayed` on
+ * the parsed body from the `Idempotency-Replayed` response header). Without this, the only way to
+ * notice a replay was to spot that screen_party_litigation's query.name/aliases had been swapped
+ * for redaction placeholders - no positive "this was a replay, you were not charged" signal
+ * existed anywhere in the tool output.
+ */
+const REPLAYED_NOTE =
+  "Replayed: identical request served from the 24 hour idempotency cache, no credits charged.";
+
 /** Wraps an envelope response {data, meta, pagination} into a tool result. */
-function envelopeResult(body: any): CallToolResult {
+function envelopeResult(body: any, extraNote?: string): CallToolResult {
   const out: Record<string, unknown> = {};
   if (body?.data !== undefined) out.data = body.data;
   if (body?.meta !== undefined) out.meta = body.meta;
   if (body?.pagination !== undefined) out.pagination = body.pagination;
-  return textResult(Object.keys(out).length > 0 ? out : body, paginationNote(body?.pagination));
+  const notes = [extraNote, paginationNote(body?.pagination)].filter((n): n is string => Boolean(n));
+  return textResult(Object.keys(out).length > 0 ? out : body, notes.length > 0 ? notes.join("\n") : undefined);
+}
+
+/** True when client.ts marked this parsed response body as a replay of an idempotency-cached call. */
+function isReplayed(body: any): boolean {
+  return Boolean(body && typeof body === "object" && body.replayed === true);
+}
+
+/**
+ * search_indian_court_cases's underlying OpenSearch index currently returns `mongoId` on each hit
+ * but not `id`, even though every tool description here (get_case, find_related_cases,
+ * get_case_pdf_url, and especially request_case_timeline's case_id) tells the calling model to
+ * pass "the id field from search results". The server is expected to add `id` additively at some
+ * point; until (and even after) it does, fill it in here from `mongoId` so the documented
+ * instruction is actually true against this endpoint's real output. Mutates each hit in place;
+ * mongoId is left untouched alongside the new id.
+ */
+function backfillSearchHitIds(body: any): void {
+  const hits = body?.data;
+  if (!Array.isArray(hits)) return;
+  for (const hit of hits) {
+    if (hit && typeof hit === "object" && hit.id === undefined && typeof hit.mongoId === "string") {
+      hit.id = hit.mongoId;
+    }
+  }
 }
 
 /**
@@ -163,7 +199,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Note: caseNumber does filter results (a single value; if an array is sent only the first element is " +
         "used). Note: sortBy is honoured: relevance, recent and oldest are all real sort orders. date is accepted " +
         "as a deprecated alias for recent, and the response's meta carries a notice explaining the substitution; " +
-        "prefer sending recent or oldest directly.",
+        "prefer sending recent or oldest directly. Each result carries an id field to pass to get_case, " +
+        "get_case_analysis, find_related_cases, get_case_pdf_url and request_case_timeline; on hits where the " +
+        "index only supplies mongoId, this tool copies mongoId into id for you, so id is always present here " +
+        "even if you also see a raw mongoId alongside it.",
       inputSchema: {
         query: z.string().trim().min(1).describe("Search text: keywords, a phrase, a case number, or a party name."),
         court: stringOrArray("Court name or list of court names to filter by."),
@@ -247,6 +286,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
 
       const result = await callApi(opts, { method: "POST", path: "search/cases", body, timeoutMs: DEFAULT_TIMEOUT_MS });
       if (!result.ok) return errorResult(result.message);
+      backfillSearchHitIds(result.data);
       return envelopeResult(result.data);
     }
   );
@@ -459,7 +499,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "free tier gets no AI analysis at all, only keyword search, case detail, related cases, judges, PDF, " +
         "semantic search and a limited party/screen allowance. This call sends an Idempotency-Key derived from " +
         "the exact id/force/allowRemoteFetch arguments, so retrying this same call (a dropped connection, a " +
-        "re-sent turn) never re-triggers analysis or re-charges credits; changing any argument runs as a new call.",
+        "re-sent turn) never re-triggers analysis or re-charges credits; changing any argument runs as a new call. " +
+        "When a replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it apart from " +
+        "a freshly computed result.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run analysis even if it already exists, default false."),
@@ -490,7 +532,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         idempotencyKey: computeIdempotencyKey("analyze_case", args),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data);
+      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
@@ -509,7 +551,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "credits are exhausted. Free tier note: this tool returns HTTP 403 API_TIER_NOT_ALLOWED with an upgrade " +
         "URL on the free tier, same as analyze_case; the free tier has no access to AI analysis in any form. " +
         "This call sends an Idempotency-Key derived from the exact id/force arguments, so retrying this same " +
-        "call never re-runs the consolidated analysis or re-charges credits; changing any argument runs as a new call.",
+        "call never re-runs the consolidated analysis or re-charges credits; changing any argument runs as a new " +
+        "call. When a replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it " +
+        "apart from a freshly computed result.",
       inputSchema: {
         id: idParam,
         force: z.boolean().optional().describe("Re-run consolidated analysis even if it already exists, default false."),
@@ -527,7 +571,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         idempotencyKey: computeIdempotencyKey("analyze_consolidated_case", args),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data);
+      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
@@ -574,7 +618,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "returned requestId. A live refresh can take a while against a slow court portal, so this call uses a " +
         "longer timeout than most tools. This call sends an Idempotency-Key derived from the exact " +
         "case_id/refresh arguments, so retrying this same call never re-triggers a live fetch or re-charges " +
-        "credits; changing any argument runs as a new call.",
+        "credits; changing any argument runs as a new call. When a replay happens, the result text starts with a " +
+        "\"Replayed: ...\" line so you can tell it apart from a freshly computed result.",
       inputSchema: {
         case_id: z
           .string()
@@ -603,7 +648,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         idempotencyKey: computeIdempotencyKey("request_case_timeline", args),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data);
+      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
@@ -692,8 +737,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "search plus deterministic party screening only. This is a records search, not a legal or compliance " +
         "opinion; casePageUrl in each match links to the public case page. This call sends an Idempotency-Key " +
         "derived from every argument here, so retrying this exact same screen never re-charges credits; changing " +
-        "any argument (including name, aliases or identifiers) runs as a new, separately charged screen. Use " +
-        "screen_party_litigation_batch instead to screen more than one name in a single call.",
+        "any argument (including name, aliases or identifiers) runs as a new, separately charged screen. When a " +
+        "replay happens, the result text starts with a \"Replayed: ...\" line so you can tell it apart from a " +
+        "freshly computed result (in addition to query.name/query.aliases coming back redacted, same as any " +
+        "stored record). Use screen_party_litigation_batch instead to screen more than one name in a single call.",
       inputSchema: {
         name: z
           .string()
@@ -830,7 +877,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         idempotencyKey: computeIdempotencyKey("screen_party_litigation", args),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data);
+      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
@@ -946,7 +993,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "as screen_party_litigation - always surface those per item rather than summarizing the whole batch as a " +
         "single clean or dirty result. This call sends an Idempotency-Key derived from every argument here, so " +
         "retrying this exact same batch never re-charges credits; changing any item runs as a new, separately " +
-        "charged batch.",
+        "charged batch. When a replay happens, the result text starts with a \"Replayed: ...\" line so you can " +
+        "tell it apart from a freshly computed result.",
       inputSchema: {
         items: z
           .array(
@@ -1032,7 +1080,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         idempotencyKey: computeIdempotencyKey("screen_party_litigation_batch", args),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data);
+      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
