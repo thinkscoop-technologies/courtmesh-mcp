@@ -1,0 +1,3822 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CourtMesh Public API",
+    "version": "1.1.0",
+    "summary": "Programmatic access to Indian court judgments, orders and AI case analysis.",
+    "description": "The CourtMesh public API exposes the same case corpus that powers courtmesh.ai:\nSupreme Court of India, all High Courts, District Courts and tribunals.\n\n## Two search engines\n\nThe API offers two distinct search endpoints and they cover different corpora:\n\n- `POST /search/cases` runs keyword and boolean search over the full OpenSearch index of 310M+ records.\n  It is fast, exact and does not consume AI credits. Use it for case numbers, party names, citations,\n  judge names and exact phrases.\n- `POST /search/cases/semantic` runs vector similarity search over the roughly 2M case subset that has\n  embeddings. It consumes AI credits and is slower. Use it for natural language questions about legal\n  concepts, fact patterns and doctrines.\n\n## Response envelope\n\nEvery endpoint except `GET /health` wraps its payload in a standard envelope:\n\n```json\n{ \"success\": true, \"data\": ..., \"meta\": { ... }, \"pagination\": { ... } }\n```\n\nFailures inside a handler return `{ \"success\": false, \"error\": \"...\" }`. Failures raised by the\nauthentication middleware, which runs before the handler, return a bare `{ \"error\": \"...\" }` with no\n`success` field. Clients should treat both as errors.\n\n## Credits\n\nEndpoints marked with the `ai` tag deduct AI credits from the account that owns the API key.\nKeyword search, case retrieval, related documents, PDF links, judge search and timeline endpoints do not.\n\nMost endpoints are 1 credit. The ones that are not:\n\n| Endpoint | Credits |\n|---|---|\n| `GET /cases/{id}/pdf` | 5 |\n| `POST /search/cases/semantic` | 10 |\n| `POST /request-timeline` | 20 (1 when served from today's cached orders) |\n| `POST /cases/{id}/analyze` | 100 (1 when an existing analysis is returned without re-running) |\n| `POST /cases/{id}/analyze-consolidated` | 400 |\n| `POST /party/screen`, matches found | 100 |\n| `POST /party/screen`, no matches found | 20 |\n| `POST /party/screen` with `adjudicate: true` | add 80, so up to 180 for one call |\n\nA 402 response (`code: \"INSUFFICIENT_API_CREDITS\"`) carries `required`, `balance`, `shortfall` and a\n`topUpUrl`. Nothing is ever charged partway: a call either completes and is billed at the price above,\nor it fails and nothing is deducted.\n\n### Free tier AI lockout\n\nThe Free tier cannot call `POST /cases/{id}/analyze`, `POST /cases/{id}/analyze-consolidated` or\n`GET /cases/{id}/analysis` at all. Every one of the three refuses with `403` before any work happens\nand before any credit is charged:\n\n```json\n{\n  \"success\": false,\n  \"code\": \"API_TIER_NOT_ALLOWED\",\n  \"message\": \"AI analysis is not available on the Free tier. Upgrade to generate or read case analyses.\",\n  \"tier\": \"free\",\n  \"upgradeUrl\": \"https://research.courtmesh.ai/api/settings/api-keys#credits\"\n}\n```\n\nThe Free tier keeps keyword search, case detail, related documents, judge search, PDF links, semantic\nsearch and `POST /party/screen` (10 screens per month, deterministic only, see\n\"Litigation Check\" below). There is no free monthly analyze allowance any more; upgrade to PAYG, Scale\nor Enterprise for AI analysis.\n\n## What a record is\n\nA \"record\" is any case CourtMesh has indexed from a court registry: parties, dates, disposal status and\nthe docket. Not every record carries the underlying order or judgment text:\n\n- **Document bearing** records have the order or judgment text indexed. `POST /search/cases`,\n  `POST /search/cases/semantic`, `GET /cases/{id}`, `GET /cases/{id}/pdf`, `POST /cases/{id}/analyze` and\n  `POST /cases/{id}/analyze-consolidated` all work on document bearing records; the analyze endpoints\n  fail with `400` on a record that has neither extracted text nor a stored PDF.\n- **Status only** records are registry metadata with no document text yet: parties, case number, dates\n  and disposal status, nothing to analyze or download. They are fully returned by\n  `POST /search/cases`, `GET /cases/{id}` and `POST /party/screen`, but `hasDocuments` is `false` and\n  `GET /cases/{id}/pdf` returns `404`.\n- `total = documentBearing + statusOnly`. `GET /coverage` reports the split for the whole corpus and per\n  court; a single case record does not carry a `recordType` field of its own, `hasDocuments` is the\n  signal to read.\n\n## Restricted records\n\nA party can ask CourtMesh to withhold a case from search and screening under the case removal policy\n(https://courtmesh.ai/case-removal-policy). This is a takedown, never a deletion: the record stays in\nstorage, and only its visibility through the public and API surfaces changes.\n\n- A restricted case never appears in `POST /search/cases`, `POST /search/cases/semantic` or\n  `POST /party/screen` results or in `relatedButUnverified`.\n- A restricted case reached by its public case page returns `410 Gone`.\n- A restricted case reached directly by `GET /cases/{id}`, `GET /cases/{id}/analysis`,\n  `GET /cases/{id}/related` or `GET /cases/{id}/pdf` with its own id or case number is masked: the title\n  and party names are replaced with a registry placeholder rather than the call failing outright.\n- `POST /party/screen` discloses only a boolean, `coverage.someRecordsWithheld`, when a restricted case\n  or a masked title was dropped from that screen. The count, the id and which candidate it was are never\n  disclosed. A screen never reports `no_matches_found` on the strength of what withholding removed; see\n  \"Litigation Check\" below for the exhaustiveness rule this follows.\n\n## Rate limits\n\nEvery account has a per tier request budget enforced by `universalRateLimiter`, plus, on search\nendpoints, a per tier ceiling on how much of the corpus one call or one page walk can touch:\n\n| Tier | Requests/minute | Requests/day | Requests/month | Max page size (`limit`) | Max pagination depth |\n|---|---|---|---|---|---|\n| free | 10 | 500 | 10,000 | 20 | 1,000 |\n| payg | 60 | 20,000 | 4,00,000 | 50 | 10,000 |\n| scale | 120 | 1,00,000 | 20,00,000 | 100 | 50,000 |\n| enterprise | 600 | 10,00,000 | 2,00,00,000 | 100 | 1,00,000 |\n\nThe per minute ceiling produces `429` with `code: \"RATE_LIMITED\"` and a `Retry-After` header (see the\n\"RateLimited\" response below). The page size and pagination depth ceilings apply only to\n`POST /search/cases` and `POST /search/cases/semantic`, run after request validation, and produce `400`\nrather than `429` because they reject the shape of the request rather than its frequency:\n\n- `limit` above the tier's max page size: `400` `{ \"success\": false, \"code\": \"PAGE_LIMIT_EXCEEDED\", \"limit\": ..., \"tier\": ... }`.\n- `page * limit` above the tier's max pagination depth: `400` `{ \"success\": false, \"code\": \"PAGINATION_DEPTH_EXCEEDED\", \"limit\": ..., \"tier\": ... }`.\n\n`POST /party/screen` additionally carries its own, tighter per minute ceiling on top of the tier budget\nabove, plus a per tier cap on distinct names screened per day (repeat screens of a name already seen\ntoday do not count against it, only genuinely new names do) and, on the Free tier only, a monthly screen\ncount cap:\n\n| Tier | party/screen requests/minute | party/screen screens/month | Distinct names/day |\n|---|---|---|---|\n| free | 2 | 10 | 25 |\n| payg | 10 | unlimited | 500 |\n| scale | 30 | unlimited | 5000 |\n| enterprise | 60 | unlimited | unlimited |\n\nHitting the per endpoint minute ceiling or the distinct names ceiling both produce `429` with a\n`Retry-After` header, `code: \"RATE_LIMITED\"` for the former and `code: \"DISTINCT_NAMES_LIMIT_REACHED\"`\nfor the latter. Hitting the Free tier monthly screen count produces `403`\n`code: \"PARTY_SCREEN_LIMIT_REACHED\"`, not `429`, because it resets monthly rather than\non a rolling window.",
+    "contact": {
+      "name": "CourtMesh support",
+      "url": "https://courtmesh.ai",
+      "email": "support@courtmesh.ai"
+    },
+    "license": {
+      "name": "Proprietary",
+      "url": "https://courtmesh.ai/terms"
+    },
+    "termsOfService": "https://courtmesh.ai/terms"
+  },
+  "servers": [
+    {
+      "url": "https://research.courtmesh.ai/api/v1/prod",
+      "description": "Production"
+    }
+  ],
+  "tags": [
+    {
+      "name": "search",
+      "description": "Find cases by keyword, by natural language meaning, or find judges by name."
+    },
+    {
+      "name": "cases",
+      "description": "Retrieve a single case, its stored AI analysis, its sibling documents and its PDF link."
+    },
+    {
+      "name": "ai",
+      "description": "Endpoints that run large language models on demand. These deduct AI credits from the account that owns the API key."
+    },
+    {
+      "name": "timeline",
+      "description": "Fetch the live order and hearing history for a case from the court source systems. Asynchronous, request then poll."
+    },
+    {
+      "name": "Litigation Check",
+      "description": "Screen a person or company name against the case corpus and get back confidence scored matches. See the endpoint description for the confidence model, the DPDP purpose requirement, and what restricted records mean here."
+    },
+    {
+      "name": "Coverage",
+      "description": "Unauthenticated corpus coverage and freshness statistics: what CourtMesh has indexed, broken down by court, court type and year."
+    },
+    {
+      "name": "system",
+      "description": "Unauthenticated service health."
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyHeader": []
+    },
+    {
+      "BearerAuth": []
+    }
+  ],
+  "paths": {
+    "/judges/search": {
+      "get": {
+        "operationId": "searchJudges",
+        "tags": [
+          "search"
+        ],
+        "summary": "Search judge names",
+        "description": "Case insensitive substring search over the combined Supreme Court and High Court judge name lists.\n\nUse this to resolve the exact spelling of a judge name before passing it as the `judgeName` filter to\n`POST /search/cases`. Results are always capped at 50 names. Omitting `q`, or passing an empty `q`,\nreturns the first 50 names of the combined list rather than an error.\n\nDoes not consume AI credits.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Substring to match against judge names, case insensitive. Omit or leave empty to get the first 50 names.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "chandrachud"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching judge names, capped at 50.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "description": "Judge names as plain strings.",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "query": {
+                          "type": "string",
+                          "description": "The lower cased, trimmed search term that was applied."
+                        },
+                        "responseTime": {
+                          "type": "string",
+                          "example": "12ms"
+                        },
+                        "totalMatches": {
+                          "type": "integer",
+                          "description": "Number of names returned, which is the capped count and not the total corpus match count."
+                        }
+                      }
+                    }
+                  }
+                },
+                "examples": {
+                  "match": {
+                    "summary": "Search hit",
+                    "value": {
+                      "success": true,
+                      "data": [
+                        "HON'BLE MR. JUSTICE D.Y. CHANDRACHUD",
+                        "HON'BLE MR. JUSTICE Y.V. CHANDRACHUD"
+                      ],
+                      "meta": {
+                        "query": "chandrachud",
+                        "responseTime": "9ms",
+                        "totalMatches": 2
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Internal error. Returns `Judge data files are missing` when the server side judge lists cannot be read, otherwise `Internal server error`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/search/cases": {
+      "post": {
+        "operationId": "searchCases",
+        "tags": [
+          "search"
+        ],
+        "summary": "Keyword search across all Indian court cases",
+        "description": "Keyword and boolean search over the full OpenSearch index of 310M+ Indian court records.\nFast, exact and free of AI credit cost.\n\nPrefer this endpoint over `POST /search/cases/semantic` for case numbers, citations, party names,\njudge names and exact phrases. Use the semantic endpoint for conceptual questions.\n\n### Pagination\n\nFor the first few pages use `page`. For deep pagination pass the previous response's\n`pagination.nextCursor` array back as `searchAfter` (JSON encode the array into the string), which\navoids the deep paging cost of large `page` values.\n\n### Sorting\n\n`sortBy` accepts `relevance` (default), `recent` (newest decision date first) and `oldest`.\n`date` is a deprecated alias for `recent`: it is still accepted, and the response carries a\n`meta.warnings` entry telling you what it was applied as. `meta.sortBy` always reports the sort that\nwas actually used.\n\n### Filter notes\n\n- `caseNumber` filters on the exact case number. The search service takes a single value, so an array\n  with more than one entry is rejected with 400 rather than silently truncated.\n- `judgeName`, `judges` and `judge` are three aliases for the same filter. The handler uses the first\n  of them that is set, in that order.\n- `meta.filters` reports the filters as they were applied.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchCasesRequest"
+              },
+              "examples": {
+                "simple": {
+                  "summary": "Free text query",
+                  "value": {
+                    "query": "anticipatory bail section 438",
+                    "limit": 20
+                  }
+                },
+                "filtered": {
+                  "summary": "Filtered by court and year",
+                  "value": {
+                    "query": "arbitration award set aside",
+                    "court": "Delhi High Court",
+                    "year": [
+                      2023,
+                      2024
+                    ],
+                    "limit": 50,
+                    "sortBy": "relevance"
+                  }
+                },
+                "cursor": {
+                  "summary": "Deep pagination with a cursor",
+                  "value": {
+                    "query": "specific performance",
+                    "limit": 100,
+                    "searchAfter": "[12.483261,\"000000000000000000000000\"]"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "description": "Matching case documents. These are forwarded verbatim from the OpenSearch microservice and are NOT run through the response sanitizer, so the exact field set varies by court and by ingestion source. The properties listed here are the ones present on essentially every record; treat the object as open.",
+                      "items": {
+                        "$ref": "#/components/schemas/OpenSearchCaseHit"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "query": {
+                          "type": "string",
+                          "description": "The free text portion of the query after inline filter parsing, which may differ from what you sent."
+                        },
+                        "filters": {
+                          "type": "object",
+                          "description": "Echo of the filters received, including ones that were not applied.",
+                          "additionalProperties": true
+                        },
+                        "responseTime": {
+                          "type": "string",
+                          "example": "412ms"
+                        }
+                      }
+                    },
+                    "pagination": {
+                      "$ref": "#/components/schemas/SearchPagination"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationFailedOrTierCapExceeded"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "408": {
+            "description": "The upstream search query exceeded the 90 second budget.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "example": {
+                  "success": false,
+                  "error": "Request timeout - OpenSearch query took too long"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Internal error. Returns `OpenSearch API not configured` when the search backend is not wired up, otherwise `Internal server error`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The search backend could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "example": {
+                  "success": false,
+                  "error": "Failed to connect"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/search/cases/semantic": {
+      "post": {
+        "operationId": "semanticSearchCases",
+        "tags": [
+          "search",
+          "ai"
+        ],
+        "summary": "AI semantic search over embedded cases",
+        "description": "Vector similarity search over the case subset that has embeddings, roughly 2M records, which is a\nmuch smaller corpus than the keyword index. Consumes AI credits and can take a minute or more.\n\nBefore searching, the service uses a language model to pull structured filters out of the natural\nlanguage query and to rewrite the remainder into legal terminology. The top level filter parameters\noverride what the model extracted, and the nested `filters` object overrides both.\n\n### Important behaviours you must code for\n\n- **The status code reflects the outcome.** An earlier version of this handler flushed a 200 before\n  doing any work, so failures arrived as HTTP 200 with a `{\"success\": false}` body. They no longer do:\n  an embedding or vector search failure is a 502, and an unexpected failure is a 500. A search that\n  ran and matched nothing is still a 200 with an empty `data` array.\n- **Filters are applied where you put them.** Every top level filter parameter is mapped onto a vector\n  store key and reported in `meta.appliedFilters`. Two of them are narrower than on the keyword\n  endpoint because of what the vector index can express: `caseNumber` must be digits only, and only\n  one judge name can be filtered per request. Both are rejected with 400 rather than dropped.\n- **Filter only queries fall back to keyword search.** If the model strips the query down to fewer\n  than 3 characters, the request is served by the keyword engine instead and `meta.fallbackMode` is\n  set to `opensearch`.\n- **`pagination.total` is an estimate.** The handler fetches one extra row to detect whether another\n  page exists, so `total` and `totalPages` are exact only on the final page.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticSearchRequest"
+              },
+              "examples": {
+                "concept": {
+                  "summary": "Conceptual question",
+                  "value": {
+                    "query": "when can a court lift the corporate veil to hold directors personally liable for company debts",
+                    "limit": 20
+                  }
+                },
+                "withFilters": {
+                  "summary": "With explicit filters",
+                  "value": {
+                    "query": "medical negligence standard of care for surgeons",
+                    "limit": 10,
+                    "filters": {
+                      "court": "Supreme Court of India",
+                      "decisionDate": {
+                        "$gte": "2015-01-01",
+                        "$lte": "2024-12-31"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Semantic search results. Returned only when the search actually ran, including when it matched nothing, in which case `data` is empty and `meta.message` explains it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "title": "SemanticSearchSuccess",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/CaseListItem"
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "query": {
+                          "type": "string",
+                          "description": "Query after case number normalisation."
+                        },
+                        "originalQuery": {
+                          "type": "string",
+                          "description": "Present only when normalisation changed the query."
+                        },
+                        "appliedFilters": {
+                          "type": "object",
+                          "description": "The filters actually applied to the search: model extracted filters, overridden by the top level parameters, overridden by the nested `filters` object, after court and case type expansion.",
+                          "additionalProperties": true
+                        },
+                        "responseTime": {
+                          "type": "string",
+                          "example": "8412ms"
+                        },
+                        "searchType": {
+                          "type": "string",
+                          "const": "semantic"
+                        },
+                        "fallbackMode": {
+                          "type": "string",
+                          "const": "opensearch",
+                          "description": "Present only when the query was filter only and the request was served by the keyword engine."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Present when there were no hits, for example `No similar cases found.`"
+                        }
+                      }
+                    },
+                    "pagination": {
+                      "$ref": "#/components/schemas/EstimatedPagination"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationFailedOrTierCapExceeded"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "AI credits are exhausted or the plan does not permit AI interactions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "The request exceeded the 10 minute handler timeout.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Unexpected internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "An upstream dependency failed: the embedding provider, the vector store, or the keyword engine behind the filter only fallback.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}": {
+      "get": {
+        "operationId": "getCase",
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get case details",
+        "description": "Returns the metadata for a single case, deliberately WITHOUT the AI analysis. Call\n`GET /cases/{id}/analysis` for the analysis.\n\n`detailedSummary`, `headnote`, `holding` and `keyFacts` are not part of this payload by design; they\nlive on the analysis endpoint.\n\nDoes not consume AI credits.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Case details.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/CaseDetails"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string",
+                          "example": "31ms"
+                        },
+                        "note": {
+                          "type": "string",
+                          "example": "Use /cases/:id/analysis endpoint to get AI analysis separately"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidPathParams"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/CaseNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}/analysis": {
+      "get": {
+        "operationId": "getCaseAnalysis",
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get the stored AI analysis for a case",
+        "description": "Returns the AI analysis already stored against a case. This endpoint is read only: it never triggers\nanalysis and never consumes AI credits.\n\nWhen no analysis exists the call still succeeds with `hasAnalysis: false`, a `message` field and no\n`analysis` key. Generate one with `POST /cases/{id}/analyze` and poll this endpoint after roughly 30\nto 60 seconds.\n\nFields that are absent on the stored analysis are stripped rather than\nreturned as null, so treat every property inside `analysis` as optional.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Analysis payload, or a `hasAnalysis: false` marker.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/CaseAnalysisResult"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string",
+                          "example": "27ms"
+                        },
+                        "note": {
+                          "type": "string",
+                          "description": "Empty string when analysis exists, otherwise `Use POST /cases/:id/analyze to generate AI analysis`."
+                        }
+                      }
+                    }
+                  }
+                },
+                "examples": {
+                  "missing": {
+                    "summary": "No analysis stored yet",
+                    "value": {
+                      "success": true,
+                      "data": {
+                        "id": "000000000000000000000000",
+                        "caseNumber": "CRL.A. 1234/2023",
+                        "hasAnalysis": false,
+                        "message": "AI analysis not available for this case"
+                      },
+                      "meta": {
+                        "responseTime": "18ms",
+                        "note": "Use POST /cases/:id/analyze to generate AI analysis"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidPathParams"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/TierNotAllowed"
+          },
+          "404": {
+            "$ref": "#/components/responses/CaseNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}/related": {
+      "get": {
+        "operationId": "getRelatedCases",
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get sibling documents and the procedural timeline for a case",
+        "description": "Returns every stored document that shares the same case number as the given case, plus a timeline\nderived from those documents.\n\nThis is NOT similarity search. It answers \"what else exists in this same matter\", not \"what other\ncases are like this one\". For similar cases use `POST /search/cases/semantic`.\n\nBehaviour worth knowing:\n\n- Related documents are capped at 50 and returned newest first.\n- Only documents that have both a decision date and a stored PDF appear in `timeline`.\n- `timeline` entries are sorted oldest first, and the earliest entry is relabelled `Case Initiated`\n  unless it is already a `Final Judgment`.\n- If the case has no case number the call still succeeds with two empty arrays and\n  `meta.message: \"No case number found for this case\"`.\n\nDoes not consume AI credits.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Related documents and derived timeline.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/RelatedCasesResult"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string",
+                          "example": "44ms"
+                        },
+                        "caseNumber": {
+                          "type": "string"
+                        },
+                        "totalDocuments": {
+                          "type": "integer"
+                        },
+                        "timelineEvents": {
+                          "type": "integer"
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Only present when the case has no case number."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidPathParams"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/CaseNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}/pdf": {
+      "get": {
+        "operationId": "getCasePdfUrl",
+        "tags": [
+          "cases"
+        ],
+        "summary": "Get a time limited link to the case PDF",
+        "description": "Returns a link to the official judgment or order PDF held in CourtMesh storage.\n\n**The returned `pdfUrl` is an encrypted presigned URL, not a directly fetchable link.** It is a\npresigned S3 URL that has then been encrypted with a case specific key, and it must be decrypted\nclient side before it can be opened. The underlying presigned URL expires after 3600 seconds.\n\nReturns 404 with `PDF not available for this case` when the case has no stored document.\n\nDoes not consume AI credits.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Encrypted, time limited PDF link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/CasePdfResult"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string",
+                          "example": "96ms"
+                        },
+                        "note": {
+                          "type": "string",
+                          "example": "The PDF URL is encrypted and expires in 1 hour. Use the decryption key provided in your SDK."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidPathParams"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Either the case does not exist (`Case not found`) or it has no stored document (`PDF not available for this case`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}/analyze": {
+      "post": {
+        "operationId": "analyzeCase",
+        "tags": [
+          "cases",
+          "ai"
+        ],
+        "summary": "Trigger AI analysis of a single case",
+        "description": "Starts AI analysis of one case. **Consumes AI credits.**\n\nThis is asynchronous. The normal response is `202 Accepted` with `status: \"processing\"`, and the work\ncontinues in the background. Poll `GET /cases/{id}/analysis` after roughly 30 to 60 seconds.\n\nIf the case already has an analysis and `force` is false, the endpoint short circuits with `200` and\nreturns the existing analysis inline, with `alreadyExists: true`. Pass `force: true` to re analyse.\n\nThe background job prefers file based analysis of the stored PDFs and falls back to analysing the\nextracted text. If neither the extracted text nor a PDF source is available the request is rejected\nwith `400` before any credit is spent. Note that credit exhaustion is detected inside the background\njob, so it surfaces in server logs rather than in this response.\n\n**Consumes 100 credits (1 when `alreadyExists: true` is returned).**\nOn the Free tier this endpoint refuses with `403` `code: \"API_TIER_NOT_ALLOWED\"` before any work or\ncharge; see \"Credits\" above.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyzeRequest"
+              },
+              "examples": {
+                "default": {
+                  "summary": "Analyse if not already analysed",
+                  "value": {}
+                },
+                "force": {
+                  "summary": "Force re analysis",
+                  "value": {
+                    "force": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "An analysis already existed and `force` was not set, so it is returned as is.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string",
+                          "const": "Analysis already exists"
+                        },
+                        "analysis": {
+                          "$ref": "#/components/schemas/StoredAnalysis"
+                        },
+                        "alreadyExists": {
+                          "type": "boolean",
+                          "const": true
+                        }
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Analysis accepted and started in the background.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "message": {
+                          "type": "string",
+                          "const": "Analysis has been started"
+                        },
+                        "status": {
+                          "type": "string",
+                          "const": "processing"
+                        }
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string"
+                        },
+                        "note": {
+                          "type": "string",
+                          "example": "You can check the analysis status by calling the GET /cases/:id endpoint in 30-60 seconds."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Either request validation failed, or the case has no analysable content: `Case does not have sufficient content for analysis. Case must have at least 100 characters of text or documents with s3Key to generate AI analysis.`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrTierNotAllowed"
+          },
+          "404": {
+            "$ref": "#/components/responses/CaseNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/cases/{id}/analyze-consolidated": {
+      "post": {
+        "operationId": "analyzeCaseConsolidated",
+        "tags": [
+          "cases",
+          "ai"
+        ],
+        "summary": "AI analysis across every document in a matter",
+        "description": "Runs one AI analysis over all the documents that share the case number, producing a single merged\nview of the whole matter rather than of one judgment. **Consumes substantially more AI credits than\n`POST /cases/{id}/analyze`.**\n\nUnlike the single case endpoint this one is **synchronous**: it blocks until the model finishes, which\ncan take minutes. Set a long client timeout.\n\nDocument selection depends on the court:\n\n- High Court: the case document plus up to the 5 most recent orders attached to it.\n- Supreme Court: up to 20 documents sharing the case number.\n\nThe combined text is truncated to 100,000 characters before analysis. The result is cached against\nthe case number, so a second call returns `status: \"already_analyzed\"` unless `force` is true.\n\n**Consumes 400 credits.** On the Free tier this endpoint refuses with\n`403` `code: \"API_TIER_NOT_ALLOWED\"` before any work or charge; see \"Credits\" above.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CaseId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyzeRequest"
+              },
+              "examples": {
+                "default": {
+                  "summary": "Use cached result if present",
+                  "value": {}
+                },
+                "force": {
+                  "summary": "Force re analysis",
+                  "value": {
+                    "force": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Consolidated analysis, freshly generated or served from cache.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "success",
+                            "already_analyzed"
+                          ]
+                        },
+                        "consolidatedAnalysis": {
+                          "$ref": "#/components/schemas/StoredAnalysis"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string"
+                        },
+                        "relatedCases": {
+                          "type": "integer",
+                          "description": "Number of case documents that fed the analysis. Absent on the cached path."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed, or the case has no case number (`Case number is required for consolidated analysis`), or none of the documents carry text (`No text content available for analysis`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrTierNotAllowed"
+          },
+          "404": {
+            "description": "`Case not found`, or `No related cases or orders found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "`Consolidated AI analysis failed` when the model returns nothing, otherwise `Internal server error`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/party/screen": {
+      "post": {
+        "operationId": "screenParty",
+        "tags": [
+          "Litigation Check",
+          "ai"
+        ],
+        "summary": "Screen a person or company name against the case corpus",
+        "description": "Searches the corpus for cases naming the given person or company, resolves how likely each\ncandidate is to actually be that party, and returns confidence scored matches. Tagged `ai` because\nthe optional `adjudicate: true` pass runs a language model over the uncertain middle; the\ndeterministic core (name similarity, identifier matching) always runs and never calls a model.\n\n### Pricing\n\nA screen that finds at least one match costs 100 credits. A screen that finds\nnone costs only 20: the retrieval work is the same either way, but a\ngenuine negative did not produce anything to analyse. `adjudicate: true` adds a flat\n80 credit surcharge whenever it is requested, regardless of how\nmany candidates actually needed the model (at most 40 per call), so the\nmost one call can ever cost is 180 credits. `meta.creditsCharged`\nreports what this call actually cost; reconstruct your bill from it rather than assuming the price\ntable, since the no-match price applies whenever `summary.matchCount` is 0 regardless of what you\nexpected going in.\n\n### Confidence bands\n\nEach match carries `confidence.band`, one of four values, driven by a calibrated match probability\n`confidence.score` between 0 and 1:\n\n| Band | Score | Meaning |\n|---|---|---|\n| `confirmed` | >= 0.90, or an exact statutory identifier match (PAN, GSTIN, CIN, LLPIN) | High confidence this candidate is the searched party. |\n| `probable` | >= 0.70 | Strong name and context evidence, short of confirmed. |\n| `possible` | >= 0.45 | Plausible but weak evidence; review before acting on it. |\n| `unlikely` | below 0.45, or an identifier conflict | Shown only if it clears `displayThreshold`; usually filtered out. |\n\n**A person is never auto-confirmed on name evidence alone.** For `entityType: \"person\"`, a name-only\nmatch is capped below the `confirmed` threshold even at a perfect name similarity; the candidate can\nonly reach `confirmed` through an exact identifier match, or, with `adjudicate: true`, a model that\nstill respects the same cap on a common name with no disambiguator. This mirrors the identical rule\nin CourtMesh's CLM counterparty screening, on purpose: the same name, however common, must never be\nsilently treated as one person across products.\n\n`confidence.engine` is `\"rules\"` when the deterministic core produced the band, or `\"llm\"` when\n`adjudicate: true` was set and the model actually reviewed that candidate (it does not run on every\ncandidate: only the ones the deterministic core could not already decide, capped at\n40 per call, cheapest and most ambiguous first).\n\n### The verdict and exhaustiveness\n\n`summary.verdict` is `\"matches_found\"` whenever `matches` is non-empty. It is `\"no_matches_found\"`\nONLY when the underlying search was actually exhaustive for this name\n(`coverage.exhaustive || coverage.exhaustiveWithinFilters`). Anything short of that, a plan clamp, a\nstrategy that errored, a merely partial run, reports `\"inconclusive\"` instead: an absence of matches\nis never reported as an absence of litigation history unless the retrieval genuinely covered the\ncorpus. Read `coverage.strategiesRun`, `coverage.planClamped` and `coverage.anyStrategyErrored` to\nsee why a call came back inconclusive.\n\n### Restricted records\n\nA case withheld under the case removal policy, or one still carrying a registry masking token on its\ntitle, is dropped before scoring and never appears in `matches` or `relatedButUnverified`.\n`coverage.someRecordsWithheld` is the ONLY signal this happened: it is a plain boolean, never a count\nor an id, and it does not by itself flip the verdict away from `\"matches_found\"` when other matches\nstill stand. See \"Restricted records\" above for the full policy.\n\n### DPDP and logging\n\n`purpose` is required so the caller states, per DPDP section 5 grounds, why this name is being\nprocessed before CourtMesh does any work on it. The searched `name`, `aliases`, `knownPersons`,\n`identifiers` and `address` are never written to any log or to `api_key_transactions`: only their\nlengths and counts are, alongside `purpose`, `entityType`, the match count and whether adjudication\nran. This is the same data minimisation `POST /search/cases/semantic` and the internal screening\nservice already follow.\n\n### relatedButUnverified\n\nCandidates the search layer surfaced but that did not clear the scoring floor, or exist only to show\nwhy a stronger match was preferred, are returned separately in `relatedButUnverified` with only the\nplain case fields, no `confidence`, `evidence`, `partyRole` or `rationale`. Treat these as leads to\nreview manually, not as scored results.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PartyScreenRequest"
+              },
+              "examples": {
+                "company": {
+                  "summary": "Screen a company for BGV",
+                  "value": {
+                    "name": "Acme Infrastructure Private Limited",
+                    "entityType": "company",
+                    "purpose": "bgv",
+                    "identifiers": {
+                      "cin": "U45200DL2010PTC123456"
+                    },
+                    "limit": 40
+                  }
+                },
+                "personWithAliases": {
+                  "summary": "Screen a person, with aliases and an address disambiguator",
+                  "value": {
+                    "name": "Ramesh Kumar",
+                    "aliases": [
+                      "Ramesh K. Sharma"
+                    ],
+                    "entityType": "person",
+                    "purpose": "kyc",
+                    "address": {
+                      "city": "Lucknow",
+                      "state": "Uttar Pradesh"
+                    },
+                    "adjudicate": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Screen completed. Present even when `summary.matchCount` is 0.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/PartyScreenResult"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "required": [
+                        "creditsCharged",
+                        "adjudicated",
+                        "corpusAsOf"
+                      ],
+                      "properties": {
+                        "creditsCharged": {
+                          "type": "integer",
+                          "description": "What this call actually cost: the match or no-match base price, plus the adjudication surcharge if `adjudicate` was true. See \"Pricing\" above.",
+                          "example": 100
+                        },
+                        "adjudicated": {
+                          "type": "boolean",
+                          "description": "Echo of the request's `adjudicate` flag."
+                        },
+                        "corpusAsOf": {
+                          "type": "string",
+                          "format": "date-time",
+                          "description": "The `generatedAt` timestamp of the coverage snapshot in effect when this screen ran (the same value `GET /coverage` reports). A rough freshness bound on the corpus this screen searched, not a per case timestamp."
+                        },
+                        "responseTime": {
+                          "type": "string",
+                          "example": "1840ms"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "402": {
+            "$ref": "#/components/responses/InsufficientApiCredits"
+          },
+          "403": {
+            "description": "One of three refusals, distinguished by `code`, all produced before any work or charge:\n\n- `API_NOT_AVAILABLE_ON_TRIAL`: the account is still on trial. API access, including\n  this endpoint, is not available during trial.\n- `API_ENTERPRISE_ONLY`: self serve tiers are off and this key is not Enterprise.\n- `PARTY_SCREEN_LIMIT_REACHED`: the Free tier's\n  `10` screens per month cap is reached. Only the Free tier has\n  a monthly screen cap; every other tier is unlimited here (the per minute and distinct-names\n  ceilings in \"Rate limits\" above still apply to all tiers).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForbiddenError"
+                },
+                "examples": {
+                  "trial": {
+                    "summary": "Trial account",
+                    "value": {
+                      "error": "API access is not available during trial. It unlocks automatically when your trial ends or you upgrade.",
+                      "code": "API_NOT_AVAILABLE_ON_TRIAL",
+                      "callsToday": 0,
+                      "maxAllowed": 0
+                    }
+                  },
+                  "monthlyCapReached": {
+                    "summary": "Free tier monthly screen cap reached",
+                    "value": {
+                      "error": "Monthly party screen limit reached",
+                      "code": "PARTY_SCREEN_LIMIT_REACHED",
+                      "callsToday": 10,
+                      "maxAllowed": 10
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Two different limiters can produce this status, distinguished by `code`:\n\n- `code: \"RATE_LIMITED\"`: this endpoint's own, tighter per minute ceiling (see the\n  `party/screen requests/minute` column in \"Rate limits\" above) was exceeded, on top of the\n  account's overall per minute budget.\n- `code: \"DISTINCT_NAMES_LIMIT_REACHED\"`: the tier's distinct-names-per-day cap was exceeded.\n  Repeat screens of a name already seen today do not count against this; only new names do.\n\nBoth set a `Retry-After` header in seconds and share the `RateLimitError` body shape.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitError"
+                },
+                "examples": {
+                  "perMinute": {
+                    "summary": "Endpoint per minute ceiling",
+                    "value": {
+                      "success": false,
+                      "error": "Rate limit exceeded",
+                      "code": "RATE_LIMITED",
+                      "message": "Too many requests. This endpoint allows 10 requests per minute.",
+                      "retryAfter": 37,
+                      "resetTime": "2026-09-18T09:15:00.000Z"
+                    }
+                  },
+                  "distinctNames": {
+                    "summary": "Distinct names per day cap",
+                    "value": {
+                      "success": false,
+                      "error": "Rate limit exceeded",
+                      "code": "DISTINCT_NAMES_LIMIT_REACHED",
+                      "message": "This tier allows 25 distinct names per day.",
+                      "retryAfter": 41400,
+                      "resetTime": "2026-09-19T00:00:00.000Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/request-timeline": {
+      "post": {
+        "operationId": "requestCaseTimeline",
+        "tags": [
+          "timeline"
+        ],
+        "summary": "Request the live order and hearing history for a case",
+        "description": "Starts a job that fetches the current order and hearing history for a case from the court source\nsystems. Poll the returned `requestId` with `GET /get-timeline/{requestId}`.\n\n`case_id` must be the 24 character MongoDB ObjectId of the case, which is the `id` field returned by\nthe search and case endpoints. A case number will not work here.\n\nBehaviour differs by court:\n\n- Supreme Court cases return immediately with `status: \"completed\"`, `orderCount: 0` and a message\n  explaining that SC cases have no separate orders.\n- District Court cases are fetched synchronously and come back `completed` or `failed`.\n- High Court cases are queued and normally come back `pending`, so they need polling. If orders were\n  already fetched today the response is served from cache with `cached: true` and the orders inline.\n\nThis endpoint has no zod schema. `case_id` is checked manually: it must be present and must be a 24\ncharacter hexadecimal id, otherwise the request is rejected with 400.\nDoes not consume AI credits.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestTimelineRequest"
+              },
+              "examples": {
+                "default": {
+                  "summary": "Request orders",
+                  "value": {
+                    "case_id": "000000000000000000000000"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job accepted, or cached orders returned inline.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/TimelineRequestResult"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`case_id is required`, or `case_id must be a 24 character hexadecimal case id` when the value cannot be an ObjectId.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/CaseNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/get-timeline/{requestId}": {
+      "get": {
+        "operationId": "getCaseTimeline",
+        "tags": [
+          "timeline"
+        ],
+        "summary": "Poll a timeline request",
+        "description": "Returns the status, and when finished the payload, of a job created by `POST /request-timeline`.\n\nPoll until `status` is `completed` or `failed`. When orders have been fetched they arrive in `orders`,\nwith `orderCount` for this response and `totalOrderCount` for the case overall. The generic `result`\nobject is only included when `totalOrderCount` is absent, to avoid two competing representations of\nthe same data.\n\nDoes not consume AI credits.",
+        "parameters": [
+          {
+            "name": "requestId",
+            "in": "path",
+            "required": true,
+            "description": "The `requestId` returned by `POST /request-timeline`.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "000000000000000000000000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status and, when available, the fetched orders.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/TimelineJobStatus"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "properties": {
+                        "responseTime": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "`Request not found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/StandingUnavailable"
+          }
+        }
+      }
+    },
+    "/coverage": {
+      "get": {
+        "operationId": "getCoverage",
+        "tags": [
+          "Coverage"
+        ],
+        "summary": "Corpus coverage and freshness statistics",
+        "description": "**No API key required.** This is the \"check our numbers before you buy\" surface: it is meant to be\ncallable straight from curl or from the public coverage page, so it sits outside the metered key\nauthentication every other endpoint on this page requires and outside the credit system entirely.\n\nBacked by a 6 hour server side cache (`coverage:v1`) of a query against the OpenSearch index, with a\nstale-serve fallback: an expired cache still serves its last known snapshot while a refresh is\nattempted in the background, rather than blocking the request or failing it. Only a cold cache with\nthe source unreachable returns `503`.\n\n`data.total = data.documentBearing + data.statusOnly`. See \"What a record is\" above for what those\ntwo counts mean. `data.districtCourts` is one rolled up row rather than a row per court: the index\ncarries no state field to group District Courts by today.\n\n`Cache-Control: public, max-age=300, stale-while-revalidate=3600` is set on a `200`;\n`Cache-Control: no-store` on a `503`. CORS is permissive: `Access-Control-Allow-Origin` is set for\nevery caller (courtmesh.ai and any configured marketing origin get their own origin reflected back;\nanyone else, including a bare curl with no `Origin` header, gets a usable wildcard-equivalent value\nrather than being refused), because the data is identical and public for every caller regardless of\norigin.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Coverage snapshot, fresh or served stale from cache.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "data",
+                    "meta"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/CoverageData"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "required": [
+                        "generatedAt",
+                        "cacheTtlSeconds",
+                        "corpusNote"
+                      ],
+                      "properties": {
+                        "generatedAt": {
+                          "type": "string",
+                          "format": "date-time",
+                          "description": "Same value as `data.generatedAt`, repeated here so callers who only read `meta` still get it."
+                        },
+                        "cacheTtlSeconds": {
+                          "type": "integer",
+                          "example": 21600,
+                          "description": "How long a snapshot is served before a refresh is attempted. Currently 6 hours."
+                        },
+                        "corpusNote": {
+                          "type": "string",
+                          "description": "Plain language explanation of documentBearing vs statusOnly, repeated here so the field is self describing without reading this page.",
+                          "example": "A record is any case CourtMesh has indexed from a court registry (parties, dates, status, docket). \"documentBearing\" counts records that also have the order or judgment text indexed; the rest are \"statusOnly\", registry metadata with no document text yet. total = documentBearing + statusOnly."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The cache is cold (nothing to serve stale) and the coverage source could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "example": {
+                  "success": false,
+                  "error": "Coverage data is temporarily unavailable. Please try again shortly."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "getApiHealth",
+        "tags": [
+          "system"
+        ],
+        "summary": "Service health",
+        "description": "Unauthenticated liveness check. This is the only endpoint that requires no API key and the only one\nthat does not use the standard `data` envelope.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "success",
+                    "status",
+                    "version",
+                    "timestamp"
+                  ],
+                  "properties": {
+                    "success": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "status": {
+                      "type": "string",
+                      "const": "healthy"
+                    },
+                    "version": {
+                      "type": "string",
+                      "example": "1.0.0"
+                    },
+                    "timestamp": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "status": "healthy",
+                  "version": "1.0.0",
+                  "timestamp": "2026-08-10T09:14:22.104Z"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "CourtMesh API key sent in the `X-API-Key` header.\n\nKeys look like `cm-` followed by 32 base64url characters, a hyphen, then 4 more base64url characters.\nLegacy keys issued with the `vv-` prefix are still accepted. Keys that do not match that shape are\nrejected with `401 Invalid API key format` before any lookup happens."
+      },
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The same API key may instead be sent as `Authorization: Bearer <key>`. The `X-API-Key` header takes precedence when both are present."
+      }
+    },
+    "parameters": {
+      "CaseId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Either the 24 character MongoDB ObjectId of the case, or its case number.\n\nA 24 character hexadecimal value is looked up by `_id` first, and if no document matches it is then\nlooked up as a case number. Anything else goes straight to the case number lookup. 404 means neither\nlookup found a document.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "examples": {
+          "objectId": {
+            "summary": "By internal id",
+            "value": "000000000000000000000000"
+          },
+          "caseNumber": {
+            "summary": "By case number",
+            "value": "CRL.A. 1234/2023"
+          }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "The API key is missing, malformed, unknown or deactivated. This is produced by the authentication\nmiddleware before the handler runs, so the body is a bare `{ \"error\": \"...\" }` with no `success` field.\n\nObserved messages: `API key required. Provide it in X-API-Key header or Authorization: Bearer <key>`,\n`Invalid API key format`, `Invalid API key`, `API key is deactivated`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BareError"
+            },
+            "example": {
+              "error": "Invalid API key"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The key is valid but the account is not allowed to make this call. Produced by the authentication\nmiddleware, so the body is a bare `{ \"error\": \"...\" }`.\n\nCauses: `Organization is deactivated`, `Account is suspended`, `Billing is inactive for this account`,\n`Account not found`, a caller IP that is not on the organisation IP whitelist, or the daily API call\nquota being exhausted. The quota case adds `callsToday` and `maxAllowed` alongside `error`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ForbiddenError"
+            },
+            "example": {
+              "error": "API call limit reached",
+              "callsToday": 1000,
+              "maxAllowed": 1000
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Too many requests. Two different limiters can produce this status.\n\nThe plan level limiter returns `{ \"error\": \"Rate limit exceeded\" }`. The per minute limiter returns\nthe richer body shown here, including `retryAfter` in seconds and a `code` (`RATE_LIMITED` for a\nplain per minute ceiling; `POST /party/screen` can also return `DISTINCT_NAMES_LIMIT_REACHED` here,\nsee that endpoint's own 429 documentation). Back off for `retryAfter` seconds when the field is\npresent.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RateLimitError"
+            },
+            "example": {
+              "success": false,
+              "error": "Rate limit exceeded",
+              "code": "RATE_LIMITED",
+              "message": "Too many requests. Maximum 60 requests per minute allowed.",
+              "retryAfter": 37,
+              "resetTime": "2026-08-10T09:15:00.000Z"
+            }
+          }
+        }
+      },
+      "TierNotAllowed": {
+        "description": "The Free tier cannot call this endpoint at all: `TIER_LIMITS.free.analysisReadAllowed` is `false`,\nso `GET /cases/{id}/analysis` refuses every Free tier caller with this response before any work\nhappens. See \"Credits\" above for the full Free tier AI lockout.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TierNotAllowedError"
+            },
+            "example": {
+              "success": false,
+              "code": "API_TIER_NOT_ALLOWED",
+              "message": "AI analysis is not available on the Free tier. Upgrade to generate or read case analyses.",
+              "tier": "free",
+              "upgradeUrl": "https://research.courtmesh.ai/api/settings/api-keys#credits"
+            }
+          }
+        }
+      },
+      "ForbiddenOrTierNotAllowed": {
+        "description": "Either AI credits are exhausted or the account's plan does not permit AI interactions at all\n(`ErrorEnvelope`, no `code`), or, when the caller is on the Free tier, this endpoint refuses outright\nbefore any work or charge (`TierNotAllowedError`, `code: \"API_TIER_NOT_ALLOWED\"`, carries\n`upgradeUrl`). See \"Credits\" above for the Free tier AI lockout.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                {
+                  "$ref": "#/components/schemas/TierNotAllowedError"
+                }
+              ]
+            },
+            "examples": {
+              "aiCreditsExhausted": {
+                "summary": "AI credits exhausted or plan does not permit AI",
+                "value": {
+                  "success": false,
+                  "error": "Insufficient AI credits"
+                }
+              },
+              "tierNotAllowed": {
+                "summary": "Free tier lockout",
+                "value": {
+                  "success": false,
+                  "code": "API_TIER_NOT_ALLOWED",
+                  "message": "AI analysis is not available on the Free tier. Upgrade to generate or read case analyses.",
+                  "tier": "free",
+                  "upgradeUrl": "https://research.courtmesh.ai/api/settings/api-keys#credits"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InsufficientApiCredits": {
+        "description": "The account's API credit wallet does not cover this call's price. Nothing is charged. `required` is\nthe credits this call would have cost, `balance` is the wallet balance at the time of the check, and\n`shortfall` is `required - balance`. `wallet` is always `\"api_credits\"`, naming which of the two\nwallets this is (never the in app platform wallet, which API calls never touch), and `walletOwner`\nis `\"user\"` or `\"org\"`. `topUpUrl` links to the credit purchase surface; on an org owned wallet a\nnon admin caller gets `contactAdmin: true` instead, since only an admin can top it up.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/InsufficientApiCreditsError"
+            },
+            "example": {
+              "success": false,
+              "error": "Insufficient API credits",
+              "code": "INSUFFICIENT_API_CREDITS",
+              "message": "This call needs 100 credits and the wallet has 42.",
+              "required": 100,
+              "balance": 42,
+              "shortfall": 58,
+              "wallet": "api_credits",
+              "walletOwner": "user",
+              "topUpUrl": "https://research.courtmesh.ai/api/settings/api-keys#credits"
+            }
+          }
+        }
+      },
+      "StandingUnavailable": {
+        "description": "The identity service could not confirm the account standing, so the request was refused rather than allowed through. Retry with backoff. Body is a bare `{ \"error\": \"Unable to verify account standing. Please retry.\" }`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BareError"
+            },
+            "example": {
+              "error": "Unable to verify account standing. Please retry."
+            }
+          }
+        }
+      },
+      "ValidationFailed": {
+        "description": "Request body failed zod validation. `details` lists one human readable message per offending field, in `field: message` form.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ValidationErrorEnvelope"
+            },
+            "example": {
+              "success": false,
+              "error": "Validation failed. Please check your request and try again.",
+              "details": [
+                "query: Search query cannot be empty. Please provide a search term.",
+                "limit: Limit cannot exceed 100 results per page."
+              ]
+            }
+          }
+        }
+      },
+      "ValidationFailedOrTierCapExceeded": {
+        "description": "Either zod request validation failed (`ValidationErrorEnvelope`, has `error` and `details`), or,\nafter validation passed, the per tier query-shape guard rejected the request's `page`/`limit` shape\n(`TierCapExceededError`, has `code` and `tier`, no `error` field). See \"Rate limits\" above for the\nper tier `maxPageSize` and `maxPaginationDepth` values these two codes enforce:\n\n- `code: \"PAGE_LIMIT_EXCEEDED\"`: `limit` is above this tier's max page size.\n- `code: \"PAGINATION_DEPTH_EXCEEDED\"`: `page * limit` is above this tier's max pagination depth.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ValidationErrorEnvelope"
+                },
+                {
+                  "$ref": "#/components/schemas/TierCapExceededError"
+                }
+              ]
+            },
+            "examples": {
+              "validationFailed": {
+                "summary": "Zod validation failed",
+                "value": {
+                  "success": false,
+                  "error": "Validation failed. Please check your request and try again.",
+                  "details": [
+                    "query: Search query cannot be empty. Please provide a search term.",
+                    "limit: Limit cannot exceed 100 results per page."
+                  ]
+                }
+              },
+              "pageLimitExceeded": {
+                "summary": "limit above this tier's max page size",
+                "value": {
+                  "success": false,
+                  "code": "PAGE_LIMIT_EXCEEDED",
+                  "limit": 75,
+                  "tier": "free"
+                }
+              },
+              "paginationDepthExceeded": {
+                "summary": "page * limit above this tier's max pagination depth",
+                "value": {
+                  "success": false,
+                  "code": "PAGINATION_DEPTH_EXCEEDED",
+                  "limit": 20,
+                  "tier": "free"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InvalidPathParams": {
+        "description": "A path parameter failed validation.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ValidationErrorEnvelope"
+            },
+            "example": {
+              "success": false,
+              "error": "Invalid URL parameters. Please check your request and try again.",
+              "details": [
+                "id: Case ID cannot be empty. Please provide a valid case ID or case number."
+              ]
+            }
+          }
+        }
+      },
+      "CaseNotFound": {
+        "description": "No case matches the supplied id or case number.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "example": {
+              "success": false,
+              "error": "Case not found"
+            }
+          }
+        }
+      },
+      "ServerError": {
+        "description": "Unhandled server error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "example": {
+              "success": false,
+              "error": "Internal server error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "BareError": {
+        "type": "object",
+        "title": "BareError",
+        "description": "Error shape produced by middleware that runs before the route handler. It has no `success` field.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "ForbiddenError": {
+        "type": "object",
+        "title": "ForbiddenError",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "description": "Machine readable refusal code. Not present on every 403 (the oldest causes, an inactive org or a bad IP, predate this field), but present on every refusal added since: `API_ENTERPRISE_ONLY`, `API_NOT_AVAILABLE_ON_TRIAL`, `API_KEY_LIMIT_REACHED`, `FREE_TIER_AI_CAP_REACHED`, `PARTY_SCREEN_LIMIT_REACHED`.",
+            "enum": [
+              "API_ENTERPRISE_ONLY",
+              "API_NOT_AVAILABLE_ON_TRIAL",
+              "API_NO_KEYS",
+              "FREE_TIER_AI_CAP_REACHED",
+              "API_KEY_LIMIT_REACHED",
+              "PARTY_SCREEN_LIMIT_REACHED"
+            ]
+          },
+          "callsToday": {
+            "type": "integer",
+            "description": "Present only when the refusal is a daily API call quota, or a monthly cap reported the same way (for example `PARTY_SCREEN_LIMIT_REACHED`)."
+          },
+          "maxAllowed": {
+            "type": "integer",
+            "description": "Present only when the refusal is a daily API call quota, or a monthly cap reported the same way."
+          }
+        }
+      },
+      "TierNotAllowedError": {
+        "type": "object",
+        "title": "TierNotAllowedError",
+        "description": "Refusal shape for API_TIER_NOT_ALLOWED: the Free tier calling an endpoint it has no access to at all. Distinct from ForbiddenError: it always carries `success`, `code` and `upgradeUrl`.",
+        "required": [
+          "success",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "code": {
+            "type": "string",
+            "const": "API_TIER_NOT_ALLOWED"
+          },
+          "message": {
+            "type": "string",
+            "example": "AI analysis is not available on the Free tier. Upgrade to generate or read case analyses."
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "payg",
+              "scale",
+              "enterprise"
+            ]
+          },
+          "upgradeUrl": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://research.courtmesh.ai/api/settings/api-keys#credits"
+          }
+        }
+      },
+      "TierCapExceededError": {
+        "type": "object",
+        "title": "TierCapExceededError",
+        "description": "Returned by the per tier query-shape guard (server/middleware/api-tier-limits.ts), which runs after zod validation on `POST /search/cases` and `POST /search/cases/semantic`. No `error` field on this shape; check `code` instead.",
+        "required": [
+          "success",
+          "code"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "PAGE_LIMIT_EXCEEDED",
+              "PAGINATION_DEPTH_EXCEEDED"
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The `limit` value that was sent."
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "payg",
+              "scale",
+              "enterprise"
+            ]
+          }
+        }
+      },
+      "InsufficientApiCreditsError": {
+        "type": "object",
+        "title": "InsufficientApiCreditsError",
+        "description": "HTTP 402. The API credit wallet does not cover this call. See the InsufficientApiCredits response for what each field means.",
+        "required": [
+          "success",
+          "error",
+          "code",
+          "wallet"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "error": {
+            "type": "string",
+            "const": "Insufficient API credits"
+          },
+          "code": {
+            "type": "string",
+            "const": "INSUFFICIENT_API_CREDITS"
+          },
+          "message": {
+            "type": "string"
+          },
+          "required": {
+            "type": "integer",
+            "description": "Credits this call would have cost."
+          },
+          "balance": {
+            "type": "integer",
+            "description": "Wallet balance at the time of the check."
+          },
+          "shortfall": {
+            "type": "integer",
+            "description": "`required - balance`."
+          },
+          "wallet": {
+            "type": "string",
+            "const": "api_credits"
+          },
+          "walletOwner": {
+            "type": "string",
+            "enum": [
+              "user",
+              "org"
+            ]
+          },
+          "topUpUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absent when `contactAdmin` is present instead."
+          },
+          "contactAdmin": {
+            "type": "boolean",
+            "description": "Present instead of `topUpUrl` when the wallet is org owned and this caller is not an admin."
+          }
+        }
+      },
+      "RateLimitError": {
+        "type": "object",
+        "title": "RateLimitError",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false,
+            "description": "Present on the per minute and per endpoint limiters; absent on the older plan level limiter body."
+          },
+          "error": {
+            "type": "string",
+            "example": "Rate limit exceeded"
+          },
+          "code": {
+            "type": "string",
+            "description": "Present on the per minute and per endpoint limiters.",
+            "enum": [
+              "RATE_LIMITED",
+              "DISTINCT_NAMES_LIMIT_REACHED"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "description": "Present on the per minute limiter only."
+          },
+          "retryAfter": {
+            "type": "integer",
+            "description": "Seconds until the window resets. Present on the per minute limiter only."
+          },
+          "resetTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the window resets. Present on the per minute limiter only."
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "title": "ErrorEnvelope",
+        "description": "Error shape produced inside a route handler.",
+        "required": [
+          "success",
+          "error"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "ValidationErrorEnvelope": {
+        "type": "object",
+        "title": "ValidationErrorEnvelope",
+        "required": [
+          "success",
+          "error"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "const": false
+          },
+          "error": {
+            "type": "string"
+          },
+          "details": {
+            "type": "array",
+            "description": "One message per offending field. Absent on non validation 400s.",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SearchPagination": {
+        "type": "object",
+        "title": "SearchPagination",
+        "description": "Pagination block for keyword search. It is the pagination object returned by the search backend with `hasMore` recomputed by the API layer. Note that `totalPages` is only present on the degraded path where the backend returned no pagination at all, so do not depend on it; use `hasMore` and `nextCursor`.",
+        "properties": {
+          "page": {
+            "type": "integer",
+            "example": 1
+          },
+          "limit": {
+            "type": "integer",
+            "example": 20
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total matching records.",
+            "example": 4173
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "totalPages": {
+            "type": "integer",
+            "description": "Only present on the degraded fallback path."
+          },
+          "nextCursor": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "description": "Sort values of the last hit. JSON encode this array and send it back as `searchAfter` to fetch the next page.",
+            "items": {},
+            "example": [
+              12.483261,
+              "000000000000000000000000"
+            ]
+          }
+        },
+        "additionalProperties": true
+      },
+      "EstimatedPagination": {
+        "type": "object",
+        "title": "EstimatedPagination",
+        "description": "Pagination block for semantic search. `total` and `totalPages` are conservative estimates derived from fetching one extra row, and are exact only on the final page.",
+        "properties": {
+          "page": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "totalPages": {
+            "type": "integer"
+          },
+          "hasMore": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SearchCasesRequest": {
+        "type": "object",
+        "title": "SearchCasesRequest",
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Search terms. Trimmed, and must not be empty after trimming.",
+            "example": "anticipatory bail section 438"
+          },
+          "court": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Court name or names, matched verbatim against the index spelling, for example `Bombay High Court`. Comma separated strings are also split."
+          },
+          "year": {
+            "description": "Year of decision. Accepts an integer, a 4 digit string, or an array of either. Integers are bounded to 1947 (Indian independence) through the current year.",
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 1947,
+                "maximum": 2026
+              },
+              {
+                "type": "string",
+                "pattern": "^\\d{4}$"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1947,
+                      "maximum": 2026
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}$"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "caseType": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Case type code or primary type. Primary types such as `Appeal` are expanded server side into their component codes."
+          },
+          "caseNumber": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Exact case number filter, forwarded to the search service. Single valued: a string, or an array of at most one string. An array with more than one entry is rejected with 400."
+          },
+          "judgeName": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Judge name filter. Use `GET /judges/search` to resolve exact spellings."
+          },
+          "judges": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Alias for `judgeName`. Used only when `judgeName` is absent."
+          },
+          "judge": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Alias for `judgeName`. Used only when `judgeName` and `judges` are both absent."
+          },
+          "fromDate": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Inclusive lower bound on decision date, `YYYY-MM-DD`.",
+            "example": "2024-01-15"
+          },
+          "toDate": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Inclusive upper bound on decision date, `YYYY-MM-DD`.",
+            "example": "2024-12-31"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 20
+          },
+          "searchAfter": {
+            "type": "string",
+            "description": "Deep pagination cursor. JSON encode the `pagination.nextCursor` array from the previous response, for example `\"[12.483261,\\\"000000000000000000000000\\\"]\"`. A single scalar value is also accepted."
+          },
+          "sortBy": {
+            "type": "string",
+            "enum": [
+              "relevance",
+              "recent",
+              "oldest",
+              "date"
+            ],
+            "default": "relevance",
+            "description": "Sort order. `relevance` (default), `recent` (newest decision date first) or `oldest`. `date` is a deprecated alias for `recent`, kept so callers written against the old schema keep working; when you send it the response includes a `meta.warnings` entry. `meta.sortBy` reports the sort actually applied."
+          }
+        }
+      },
+      "SemanticSearchRequest": {
+        "type": "object",
+        "title": "SemanticSearchRequest",
+        "required": [
+          "query"
+        ],
+        "description": "The top level filter parameters use the same names as `POST /search/cases` and are mapped onto the vector store keys: `court` to `court`, `year` to `caseYear`, `caseType` to `caseType`, `caseNumber` to `caseNumber`, `judgeName`/`judges`/`judge` to `judgeName`, and `fromDate`/`toDate` to the `decisionDate` range. Precedence, weakest first: filters the model inferred from `query`, then these top level parameters, then the nested `filters` object. `meta.appliedFilters` reports the result.",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 3,
+            "description": "Natural language description of what you are looking for. At least 3 characters.",
+            "example": "when can a court lift the corporate veil to hold directors personally liable"
+          },
+          "court": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Court name or names, matched against the vector store `court` payload key. A High Court representative name is expanded to its member spellings. Comma separated strings are also split."
+          },
+          "year": {
+            "description": "Year of decision. Accepts an integer, a 4 digit string, or an array of either. Integers are bounded to 1947 (Indian independence) through the current year.",
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 1947,
+                "maximum": 2026
+              },
+              {
+                "type": "string",
+                "pattern": "^\\d{4}$"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1947,
+                      "maximum": 2026
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\d{4}$"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "caseType": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Case type code or primary type, mapped to the `caseType` payload key. Primary types such as `Appeal` are expanded server side into their component codes."
+          },
+          "caseNumber": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Case number, digits only, for example `1234`. The vector index stores case numbers as integers, so a value containing anything other than digits is rejected with 400. Use `POST /search/cases` to filter on a full case number string.",
+            "pattern": "^\\d+$"
+          },
+          "judgeName": {
+            "type": "string",
+            "description": "Single judge name, matched against the indexed `judges` values, so it must be the exact indexed spelling. Use `GET /judges/search` to resolve it. A one element array is also accepted; more than one judge is rejected with 400 because the vector store matches one name at a time."
+          },
+          "judges": {
+            "type": "string",
+            "description": "Alias for `judgeName`. Used only when `judgeName` is absent."
+          },
+          "judge": {
+            "type": "string",
+            "description": "Alias for `judgeName`. Used only when `judgeName` and `judges` are both absent."
+          },
+          "fromDate": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Inclusive lower bound on decision date, `YYYY-MM-DD`. Applied as `decisionDate.$gte`.",
+            "example": "2024-01-15"
+          },
+          "toDate": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Inclusive upper bound on decision date, `YYYY-MM-DD`. Applied as `decisionDate.$lte`.",
+            "example": "2024-12-31"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 20,
+            "description": "Results per page. The handler additionally clamps this to 100."
+          },
+          "filters": {
+            "type": "object",
+            "description": "Vector store filters addressed directly. These take precedence over the top level parameters and over anything the model extracted from `query`. Keys the downstream layer understands: `court`, `courtType`, `courtName`, `caseType`, `caseYear`, `registrationYear`, `decisionYear`, `judgeName`, `caseNumber`, `practiceArea`, `precedentValue`, and `decisionDate` with `$gte` and `$lte` sub keys.",
+            "additionalProperties": true,
+            "example": {
+              "court": "Supreme Court of India",
+              "decisionDate": {
+                "$gte": "2015-01-01",
+                "$lte": "2024-12-31"
+              }
+            }
+          }
+        }
+      },
+      "AnalyzeRequest": {
+        "type": "object",
+        "title": "AnalyzeRequest",
+        "additionalProperties": false,
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "Re run the analysis even when one already exists. Costs credits every time."
+          }
+        }
+      },
+      "RequestTimelineRequest": {
+        "type": "object",
+        "title": "RequestTimelineRequest",
+        "required": [
+          "case_id"
+        ],
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{24}$",
+            "description": "The 24 character MongoDB ObjectId of the case, as returned in the `id` field elsewhere in this API. A case number is not accepted, and a value that is not 24 hexadecimal characters is rejected with 400.",
+            "example": "000000000000000000000000"
+          }
+        }
+      },
+      "PartyScreenRequest": {
+        "type": "object",
+        "title": "PartyScreenRequest",
+        "description": "Mirrors partyScreenSchema (server/utils/api-v1-validations.ts) field for field. `additionalProperties` is not set to false here because the schema itself has no `.strict()` at the top level; `identifiers` and `address` are individually strict.",
+        "required": [
+          "name",
+          "entityType",
+          "purpose"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 200,
+            "description": "The person or company name to screen. Trimmed.",
+            "example": "Ramesh Kumar"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "maxItems": 7,
+            "description": "Alternate names to screen alongside `name`. At most 7: the name plus its aliases must fit within the 8 name screening limit."
+          },
+          "entityType": {
+            "type": "string",
+            "enum": [
+              "person",
+              "company"
+            ],
+            "description": "Required. Drives the confidence model: a `person` can never be auto-confirmed on name evidence alone, see the endpoint description."
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "kyc",
+              "bgv",
+              "due_diligence",
+              "litigation",
+              "research",
+              "compliance"
+            ],
+            "description": "Required. Why this name is being screened, per DPDP section 5 grounds. Never logged alongside the name itself, only alongside counts."
+          },
+          "identifiers": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Statutory identifiers. Each is format and check digit validated (server/services/entity-resolution/name-utils.ts) and rejected with 400 if malformed, rather than silently passed through as an unmatchable string. An exact match on any of these is the only way a `person` screen can reach the `confirmed` confidence band.",
+            "properties": {
+              "pan": {
+                "type": "string",
+                "example": "AAAAA9999A",
+                "description": "Permanent Account Number."
+              },
+              "gstin": {
+                "type": "string",
+                "description": "GST Identification Number."
+              },
+              "cin": {
+                "type": "string",
+                "example": "U45200DL2010PTC123456",
+                "description": "Corporate Identification Number."
+              },
+              "llpin": {
+                "type": "string",
+                "description": "LLP Identification Number."
+              }
+            }
+          },
+          "address": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "A weak corroborating signal, not an identifier: narrows ambiguity on a common name but never alone reaches `confirmed`.",
+            "properties": {
+              "city": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "state": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "stateCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10
+              }
+            }
+          },
+          "knownPersons": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "maxItems": 10,
+            "description": "Names of directors, officers or known associates. Another corroborating signal, used the same way as `address`."
+          },
+          "court": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Restrict the screen to one or more courts. The internal search service accepts a single court filter, so only the first entry of an array is honoured; this is a documented limitation, not a validation error."
+          },
+          "since": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Only consider cases with a decision or filing date on or after this date, YYYY-MM-DD. Best effort: a case with neither date is kept rather than dropped.",
+            "example": "2020-01-01"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 40,
+            "description": "Maximum candidates to retrieve before scoring."
+          },
+          "adjudicate": {
+            "type": "boolean",
+            "default": false,
+            "description": "Run the LLM adjudication pass over the uncertain middle (up to 40 candidates), adding the 80 credit surcharge. See \"Pricing\" on the endpoint."
+          },
+          "displayThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Minimum calibrated match probability for a candidate to appear in `matches`, default 0.6. A `confirmed` match is always shown regardless of this threshold."
+          }
+        }
+      },
+      "OpenSearchCaseHit": {
+        "type": "object",
+        "title": "OpenSearchCaseHit",
+        "description": "A search hit forwarded verbatim from the OpenSearch microservice. The API layer does NOT run these through the response sanitizer, and the code types them as `unknown[]`, so the exact field set is not pinned down anywhere in the source. The properties listed below are the ones present on essentially every record across Supreme Court, High Court and District Court ingestion; additional court specific fields may be present. Treat this object as open.",
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Case identifier, usable as the `{id}` path parameter."
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "court": {
+            "type": "string"
+          },
+          "caseType": {
+            "type": "string"
+          },
+          "decisionDate": {
+            "type": "string",
+            "description": "ISO date or date-time, depending on the source record."
+          },
+          "judges": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "petitioners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "respondents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "disposalNature": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "CaseListItem": {
+        "type": "object",
+        "title": "CaseListItem",
+        "description": "Compact case record returned by semantic search. Undefined fields are stripped, so treat everything except `id` as optional.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "000000000000000000000000"
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "court": {
+            "type": "string"
+          },
+          "caseType": {
+            "type": "string"
+          },
+          "judges": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "petitioners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "respondents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "decisionDate": {
+            "type": "string"
+          },
+          "disposalNature": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "hasDocuments": {
+            "type": "boolean"
+          },
+          "hasAnalysis": {
+            "type": "boolean"
+          },
+          "similarity": {
+            "type": "number",
+            "description": "Vector similarity score, roughly 0 to 1. Added by the semantic search handler only, and the minimum score threshold is 0.3."
+          }
+        }
+      },
+      "CaseDetails": {
+        "type": "object",
+        "title": "CaseDetails",
+        "description": "Case metadata. Undefined fields are stripped, so treat everything except `id` as optional. `detailedSummary`, `headnote`, `holding` and `keyFacts` are deliberately excluded and live on the analysis endpoint.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "court": {
+            "type": "string"
+          },
+          "caseType": {
+            "type": "string"
+          },
+          "judges": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "petitioners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "respondents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "decisionDate": {
+            "type": "string"
+          },
+          "disposalNature": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Present only when the source record carries a diary number.",
+            "properties": {
+              "diaryNumber": {
+                "type": "string"
+              }
+            }
+          },
+          "hasDocuments": {
+            "type": "boolean"
+          },
+          "documentCount": {
+            "type": "integer"
+          },
+          "hasAnalysis": {
+            "type": "boolean",
+            "description": "True when a stored AI analysis with a summary exists. Fetch it from `/cases/{id}/analysis`."
+          }
+        }
+      },
+      "CaseAnalysisResult": {
+        "type": "object",
+        "title": "CaseAnalysisResult",
+        "description": "When `hasAnalysis` is false the object carries `message` and no `analysis` key.",
+        "required": [
+          "id",
+          "caseNumber",
+          "hasAnalysis"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "hasAnalysis": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string",
+            "const": "AI analysis not available for this case",
+            "description": "Present only when `hasAnalysis` is false."
+          },
+          "analysis": {
+            "$ref": "#/components/schemas/AnalysisBody"
+          }
+        }
+      },
+      "AnalysisBody": {
+        "type": "object",
+        "title": "AnalysisBody",
+        "description": "The AI analysis. Every property is optional: fields the model did not produce are stripped before the response is sent.",
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "detailedSummary": {
+            "type": "string"
+          },
+          "comprehensiveSummary": {
+            "type": "string"
+          },
+          "headnote": {
+            "type": "string"
+          },
+          "holding": {
+            "type": "string"
+          },
+          "keyFacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "issues": {
+            "type": "array",
+            "description": "Legal issues paired with the court holding on each.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string"
+                },
+                "holding": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "courtsReasoning": {
+            "type": "string"
+          },
+          "citedCases": {
+            "type": "object",
+            "description": "Cited authorities bucketed by how this judgment treated them.",
+            "properties": {
+              "followed": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "distinguished": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "overruled": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "referred": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "precedentRelationships": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "petitioner": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "respondent": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "practiceAreas": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "subCategories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "procedureType": {
+            "type": "string"
+          },
+          "precedentValue": {
+            "type": "string"
+          },
+          "legalPrinciples": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "doctrinesApplied": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "statutoryInterpretation": {
+            "type": "string"
+          },
+          "constitutionalProvisions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StoredAnalysis": {
+        "type": "object",
+        "title": "StoredAnalysis",
+        "description": "The analysis object as stored, returned by the two analyze endpoints. It is passed through `sanitizeAnalysis`, which only strips the internal `analysisModel`, `analysisVersion`, `analysisDate` and `analysisMethod` fields, so it is a superset of `AnalysisBody`: it also carries `outcome`, `benchComposition`, `opinionType`, `factPattern` and `linkedCases`. Every property is optional.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AnalysisBody"
+          }
+        ],
+        "additionalProperties": true
+      },
+      "RelatedCasesResult": {
+        "type": "object",
+        "title": "RelatedCasesResult",
+        "required": [
+          "relatedDocuments",
+          "timeline"
+        ],
+        "properties": {
+          "relatedDocuments": {
+            "type": "array",
+            "description": "Documents sharing this case number, newest first, capped at 50.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Usable as the `{id}` path parameter."
+                },
+                "title": {
+                  "type": "string"
+                },
+                "caseNumber": {
+                  "type": "string"
+                },
+                "court": {
+                  "type": "string"
+                },
+                "decisionDate": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                },
+                "caseType": {
+                  "type": "string"
+                },
+                "isCurrent": {
+                  "type": "boolean",
+                  "description": "True for the document you asked about."
+                }
+              }
+            }
+          },
+          "timeline": {
+            "type": "array",
+            "description": "Chronological procedural events, oldest first. Only documents that have both a decision date and a stored PDF appear here, so this is usually shorter than `relatedDocuments`.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "date": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "Case Initiated",
+                    "Hearings / Orders",
+                    "Final Judgment"
+                  ],
+                  "description": "Derived from the document case type and disposal nature. The earliest entry is relabelled `Case Initiated` unless it is already a `Final Judgment`."
+                },
+                "statusLabel": {
+                  "type": "string",
+                  "description": "The disposal nature when present, otherwise the same value as `status`."
+                },
+                "documentId": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "CasePdfResult": {
+        "type": "object",
+        "title": "CasePdfResult",
+        "properties": {
+          "pdfUrl": {
+            "type": "string",
+            "description": "An encrypted presigned S3 URL. It is NOT directly fetchable: decrypt it client side with the case specific key first."
+          },
+          "expiresIn": {
+            "type": "integer",
+            "const": 3600,
+            "description": "Lifetime of the underlying presigned URL in seconds."
+          },
+          "caseId": {
+            "type": "string"
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "caseTitle": {
+            "type": "string"
+          }
+        }
+      },
+      "TimelineRequestResult": {
+        "type": "object",
+        "title": "TimelineRequestResult",
+        "required": [
+          "requestId",
+          "status"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "description": "Poll this with `GET /get-timeline/{requestId}`."
+          },
+          "status": {
+            "type": "string",
+            "description": "Observed values: `pending`, `completed`, `failed`.",
+            "examples": [
+              "pending",
+              "completed",
+              "failed"
+            ]
+          },
+          "cached": {
+            "type": "boolean",
+            "description": "Present when the response was served from orders already fetched today."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human readable context, present on cached and short circuit paths."
+          },
+          "orderCount": {
+            "type": "integer",
+            "description": "Number of orders included in `orders`."
+          },
+          "orders": {
+            "type": "array",
+            "description": "Order records, present only when orders were already available. The order document shape is assembled dynamically from the source court record and is not typed in the source, so treat each entry as an open object.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "TimelineJobStatus": {
+        "type": "object",
+        "title": "TimelineJobStatus",
+        "required": [
+          "requestId",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "Poll until this is `completed` or `failed`.",
+            "examples": [
+              "pending",
+              "processing",
+              "completed",
+              "failed"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string",
+            "description": "Present when the job failed."
+          },
+          "result": {
+            "type": "object",
+            "description": "Generic job result. Included only when `totalOrderCount` is absent, so that there is one representation of the orders rather than two. Untyped in the source.",
+            "additionalProperties": true
+          },
+          "orders": {
+            "type": "array",
+            "description": "Fetched orders. Untyped in the source, treat each entry as an open object.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "orderCount": {
+            "type": "integer",
+            "description": "Orders included in this response."
+          },
+          "totalOrderCount": {
+            "type": "integer",
+            "description": "Orders known for the case overall."
+          }
+        }
+      },
+      "MatchSignal": {
+        "type": "object",
+        "title": "MatchSignal",
+        "description": "One piece of evidence the confidence score was built from.",
+        "required": [
+          "name",
+          "status",
+          "weight"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "What this signal checks, for example `pan`, `name_similarity`, `address_city`."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "matched",
+              "conflicted",
+              "absent"
+            ]
+          },
+          "weight": {
+            "type": "string",
+            "enum": [
+              "strong",
+              "moderate",
+              "weak"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "description": "The exact input token(s) this signal is grounded in. No information from outside the request or the candidate case."
+          }
+        }
+      },
+      "PartyScreenCaseFields": {
+        "type": "object",
+        "title": "PartyScreenCaseFields",
+        "description": "Plain case fields shared by every entry in `matches` and `relatedButUnverified`. Undefined fields are stripped, so treat everything except `caseId` as optional.",
+        "required": [
+          "caseId"
+        ],
+        "properties": {
+          "caseId": {
+            "type": "string",
+            "description": "Usable as the `{id}` path parameter on the case endpoints."
+          },
+          "title": {
+            "type": "string"
+          },
+          "court": {
+            "type": "string"
+          },
+          "caseNumber": {
+            "type": "string"
+          },
+          "cnr": {
+            "type": "string"
+          },
+          "caseType": {
+            "type": "string"
+          },
+          "acts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "petitioners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "respondents": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "filingDate": {
+            "type": "string"
+          },
+          "decisionDate": {
+            "type": "string"
+          },
+          "disposalNature": {
+            "type": "string"
+          },
+          "citation": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "casePageUrl": {
+            "type": "string"
+          }
+        }
+      },
+      "PartyScreenMatch": {
+        "type": "object",
+        "title": "PartyScreenMatch",
+        "description": "One scored candidate. See the endpoint description for what the confidence bands mean and the rule that a person is never auto-confirmed on name evidence alone.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PartyScreenCaseFields"
+          }
+        ],
+        "required": [
+          "partyRole",
+          "confidence",
+          "evidence"
+        ],
+        "properties": {
+          "partyRole": {
+            "type": "string",
+            "enum": [
+              "petitioner",
+              "respondent",
+              "unknown"
+            ],
+            "description": "The searched party's apparent role in this case."
+          },
+          "confidence": {
+            "type": "object",
+            "required": [
+              "band",
+              "score",
+              "calibrated",
+              "engine"
+            ],
+            "properties": {
+              "band": {
+                "type": "string",
+                "enum": [
+                  "confirmed",
+                  "probable",
+                  "possible",
+                  "unlikely"
+                ]
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Alias of `calibrated`, kept as a stable top level \"the number\" field."
+              },
+              "calibrated": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "engine": {
+                "type": "string",
+                "enum": [
+                  "rules",
+                  "llm"
+                ],
+                "description": "`llm` only when `adjudicate: true` was requested and the model actually reviewed this candidate."
+              }
+            }
+          },
+          "evidence": {
+            "type": "object",
+            "required": [
+              "entityMatch",
+              "matchedFields",
+              "strategies",
+              "signals",
+              "nameSimilarity",
+              "disambiguatorPresent"
+            ],
+            "properties": {
+              "entityMatch": {
+                "type": "boolean"
+              },
+              "matchedFields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "strategies": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Which retrieval strategies surfaced this candidate."
+              },
+              "signals": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MatchSignal"
+                }
+              },
+              "nameSimilarity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Best name similarity between the searched name (or an alias) and this candidate."
+              },
+              "disambiguatorPresent": {
+                "type": "boolean",
+                "description": "Whether an identifier, address or known-person disambiguator was available for this candidate, not just a bare name."
+              }
+            }
+          },
+          "rationale": {
+            "type": "string",
+            "description": "Present when the deterministic core or the LLM produced an explanation."
+          }
+        }
+      },
+      "PartyScreenCoverage": {
+        "type": "object",
+        "title": "PartyScreenCoverage",
+        "required": [
+          "exhaustive",
+          "exhaustiveWithinFilters",
+          "planClamped",
+          "anyStrategyErrored",
+          "strategiesRun",
+          "someRecordsWithheld"
+        ],
+        "properties": {
+          "exhaustive": {
+            "type": "boolean",
+            "description": "The retrieval covered the full corpus for this name."
+          },
+          "exhaustiveWithinFilters": {
+            "type": "boolean",
+            "description": "The retrieval covered the full corpus within the filters given (`court`, `since`), even if not the whole corpus."
+          },
+          "planClamped": {
+            "type": "boolean",
+            "description": "The account's plan limited how much retrieval this call could do."
+          },
+          "anyStrategyErrored": {
+            "type": "boolean",
+            "description": "At least one retrieval strategy failed; the run is not exhaustive even if others succeeded."
+          },
+          "strategiesRun": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "someRecordsWithheld": {
+            "type": "boolean",
+            "description": "A case was dropped because it is restricted under the case removal policy, or its title carried a masking token. This is the ONLY disclosure made about withheld records: never a count, an id, or which candidate it was. See \"Restricted records\" above."
+          }
+        }
+      },
+      "PartyScreenSummary": {
+        "type": "object",
+        "title": "PartyScreenSummary",
+        "required": [
+          "matchCount",
+          "byBand",
+          "highestBand",
+          "verdict"
+        ],
+        "properties": {
+          "matchCount": {
+            "type": "integer"
+          },
+          "byBand": {
+            "type": "object",
+            "required": [
+              "confirmed",
+              "probable",
+              "possible",
+              "unlikely"
+            ],
+            "properties": {
+              "confirmed": {
+                "type": "integer"
+              },
+              "probable": {
+                "type": "integer"
+              },
+              "possible": {
+                "type": "integer"
+              },
+              "unlikely": {
+                "type": "integer"
+              }
+            }
+          },
+          "highestBand": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "confirmed",
+              "probable",
+              "possible",
+              "unlikely",
+              null
+            ],
+            "description": "Null when `matchCount` is 0."
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "matches_found",
+              "no_matches_found",
+              "inconclusive"
+            ],
+            "description": "`no_matches_found` only when the retrieval was exhaustive; otherwise `inconclusive`. See \"The verdict and exhaustiveness\" on the endpoint."
+          }
+        }
+      },
+      "PartyScreenResult": {
+        "type": "object",
+        "title": "PartyScreenResult",
+        "required": [
+          "query",
+          "summary",
+          "matches",
+          "relatedButUnverified",
+          "coverage",
+          "adjudicationsRun",
+          "notice"
+        ],
+        "properties": {
+          "query": {
+            "type": "object",
+            "description": "Echo of the request as it was actually applied, including defaulted fields (`limit`, `adjudicate`, `displayThreshold`).",
+            "required": [
+              "name",
+              "aliases",
+              "entityType",
+              "purpose",
+              "limit",
+              "adjudicate",
+              "displayThreshold"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "aliases": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "entityType": {
+                "type": "string",
+                "enum": [
+                  "person",
+                  "company"
+                ]
+              },
+              "purpose": {
+                "type": "string",
+                "enum": [
+                  "kyc",
+                  "bgv",
+                  "due_diligence",
+                  "litigation",
+                  "research",
+                  "compliance"
+                ]
+              },
+              "court": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "since": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "adjudicate": {
+                "type": "boolean"
+              },
+              "displayThreshold": {
+                "type": "number"
+              }
+            }
+          },
+          "summary": {
+            "$ref": "#/components/schemas/PartyScreenSummary"
+          },
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartyScreenMatch"
+            }
+          },
+          "relatedButUnverified": {
+            "type": "array",
+            "description": "Candidates the search layer surfaced but that did not clear the scoring floor. Plain case fields only, no confidence, evidence, partyRole or rationale.",
+            "items": {
+              "$ref": "#/components/schemas/PartyScreenCaseFields"
+            }
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/PartyScreenCoverage"
+          },
+          "adjudicationsRun": {
+            "type": "integer",
+            "description": "How many candidates the LLM actually reviewed on this call, always 0 when `adjudicate` was false."
+          },
+          "notice": {
+            "type": "string",
+            "description": "Standing notice about the case removal policy and what a no-match verdict does and does not mean, included on every response."
+          }
+        }
+      },
+      "CoverageByCourtType": {
+        "type": "object",
+        "title": "CoverageByCourtType",
+        "properties": {
+          "courtType": {
+            "type": "string"
+          },
+          "records": {
+            "type": "integer"
+          },
+          "documentBearing": {
+            "type": "integer"
+          },
+          "latestDecisionDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CoverageByYear": {
+        "type": "object",
+        "title": "CoverageByYear",
+        "properties": {
+          "year": {
+            "type": "integer"
+          },
+          "records": {
+            "type": "integer"
+          }
+        }
+      },
+      "CoverageCourtRow": {
+        "type": "object",
+        "title": "CoverageCourtRow",
+        "properties": {
+          "court": {
+            "type": "string"
+          },
+          "records": {
+            "type": "integer"
+          },
+          "documentBearing": {
+            "type": "integer"
+          },
+          "earliestDecisionDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latestDecisionDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "businessDaysBehind": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Business days between the latest indexed decision and today. Null when it cannot be computed."
+          }
+        }
+      },
+      "DistrictCourtsRollup": {
+        "type": "object",
+        "title": "DistrictCourtsRollup",
+        "description": "One rolled up row for every District Court combined: the index carries no state field to break this down further today.",
+        "properties": {
+          "records": {
+            "type": "integer"
+          },
+          "documentBearing": {
+            "type": "integer"
+          },
+          "latestDecisionDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "businessDaysBehind": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      },
+      "CoverageData": {
+        "type": "object",
+        "title": "CoverageData",
+        "required": [
+          "generatedAt",
+          "index",
+          "total",
+          "documentBearing",
+          "statusOnly",
+          "byCourtType",
+          "byYear",
+          "courts",
+          "districtCourts"
+        ],
+        "properties": {
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this snapshot was computed, not when this response was served (the snapshot may be served stale from cache)."
+          },
+          "index": {
+            "type": "string",
+            "description": "The OpenSearch index name this snapshot was computed from."
+          },
+          "total": {
+            "type": "integer",
+            "description": "`documentBearing + statusOnly`."
+          },
+          "documentBearing": {
+            "type": "integer"
+          },
+          "statusOnly": {
+            "type": "integer"
+          },
+          "byCourtType": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CoverageByCourtType"
+            }
+          },
+          "byYear": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CoverageByYear"
+            }
+          },
+          "courts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CoverageCourtRow"
+            },
+            "description": "High Courts and tribunals, one row each."
+          },
+          "districtCourts": {
+            "$ref": "#/components/schemas/DistrictCourtsRollup"
+          }
+        }
+      }
+    }
+  }
+}

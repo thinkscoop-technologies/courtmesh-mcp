@@ -1,6 +1,6 @@
 {
   "name": "@courtmesh/mcp-server",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "MCP server for the CourtMesh public REST API: search and analyze 310M+ Indian court case records from Supreme Court, High Courts, District Courts and tribunals.",
   "type": "module",
   "main": "dist/index.js",
@@ -17,6 +17,7 @@
     "build": "tsc && chmod +x dist/index.js",
     "start": "node dist/index.js",
     "test": "npm run build && node --test test/http-transport.test.mjs",
+    "test:e2e": "npm run build && node --import tsx --test test/e2e/mcp-e2e.test.ts",
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
   },
@@ -52,6 +53,7 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.9",
+    "tsx": "^4.23.13",
     "typescript": "^5.5.4"
   }
 }
