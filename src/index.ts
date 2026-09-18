@@ -26,7 +26,7 @@ import { apiKeyOverrideStorage } from "./context.js";
 import { DEFAULT_BASE_URL, isValidApiKeyFormat } from "./client.js";
 
 const SERVER_NAME = "courtmesh-mcp";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.4.0";
 
 const baseUrl = process.env.COURTMESH_API_BASE_URL?.trim() || DEFAULT_BASE_URL;
 const apiKey = process.env.COURTMESH_API_KEY?.trim() || undefined;
