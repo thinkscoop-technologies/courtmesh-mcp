@@ -216,9 +216,9 @@ const idParam = z
   .string()
   .min(1)
   .describe(
-    "Case identifier: either a 24 character MongoDB ObjectId hex string, or a case number string. " +
-      "Lookup order: the server first tries to parse this as an ObjectId; only if that parse fails does it fall " +
-      "back to looking up by case number. This means a syntactically valid but nonexistent ObjectId returns 404 " +
+    "Case identifier: either a 24 character hexadecimal case id, or a case number string. " +
+      "Lookup order: the server first tries this as a case id; only if that fails does it fall " +
+      "back to looking up by case number. This means a syntactically valid but nonexistent case id returns 404 " +
       "without ever trying the case number path."
   );
 
@@ -238,7 +238,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     {
       title: "Search Indian Court Cases",
       description:
-        "Keyword and boolean search over the full 310M plus record OpenSearch index of Indian court cases. " +
+        "Keyword and boolean search over our full 310M plus record search index of Indian court cases. " +
         "Fast, exact match, does not consume AI credits. Prefer this over semantic_search_cases for case numbers, " +
         "party names, citations, judge names and exact phrases. Use semantic_search_cases instead when the request " +
         "is a natural language question about legal concepts, doctrines or fact patterns rather than exact terms. " +
@@ -246,9 +246,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "used). Note: sortBy is honoured: relevance, recent and oldest are all real sort orders. date is accepted " +
         "as a deprecated alias for recent, and the response's meta carries a notice explaining the substitution; " +
         "prefer sending recent or oldest directly. Each result carries an id field to pass to get_case, " +
-        "get_case_analysis, find_related_cases, get_case_pdf_url and request_case_timeline; on hits where the " +
-        "index only supplies mongoId, this tool copies mongoId into id for you, so id is always present here " +
-        "even if you also see a raw mongoId alongside it.",
+        "get_case_analysis, find_related_cases, get_case_pdf_url and request_case_timeline; id is always " +
+        "present on each result.",
       inputSchema: {
         query: z.string().trim().min(1).describe("Search text: keywords, a phrase, a case number, or a party name."),
         court: stringOrArray("Court name or list of court names to filter by."),
@@ -370,7 +369,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "on the Free tier, which has no semantic search access at all, only keyword search via " +
         "search_indian_court_cases. Another quirk: if the cleaned query text ends up shorter than 3 characters " +
         "after internal processing, the service falls back to a plain keyword search and marks the response " +
-        "with meta.fallbackMode = \"opensearch\".",
+        "with meta.fallbackMode to indicate the keyword index was used instead.",
       inputSchema: {
         query: z.string().trim().min(3).describe("Natural language question or description, minimum 3 characters."),
         court: stringOrArray("Court name or list of court names to filter by."),
@@ -557,9 +556,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .boolean()
           .optional()
           .describe(
-            "Set true to allow fetching the case's source document from a remote court host (only ecourts.gov.in, " +
-              "nic.in, sci.gov.in, gov.in and courtmesh.ai hosts are ever eligible) when it is not already " +
-              "available as stored text or an S3 document. Default false. Without it, a case that needs a remote " +
+            "Set true to allow fetching the case's source document from an external source (only approved court " +
+              "and official sources are ever eligible) when it is not already " +
+              "available as stored text or a stored document. Default false. Without it, a case that needs a remote " +
               "fetch to be analyzed returns HTTP 403 REMOTE_FETCH_NOT_ALLOWED instead of running (this is a " +
               "one time consent per call, not a standing setting); when it is used and a remote fetch actually " +
               "happens, a 20 credit surcharge is added on top of the base analyze price. Not available on the " +
@@ -644,8 +643,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       title: "Get Case PDF URL",
       description:
         "Returns a time limited link to the official judgment PDF for a case. No AI credits consumed. CRITICAL: " +
-        "the returned pdfUrl is an ENCRYPTED presigned S3 URL, not a directly fetchable link, it must be " +
-        "decrypted with a case specific key before use, and it expires after the returned expiresIn seconds " +
+        "the returned pdfUrl is an ENCRYPTED, time limited link, not a directly fetchable link, it must be " +
+        "decrypted before use, and it expires after the returned expiresIn seconds " +
         "(normally 3600). Do not attempt to fetch pdfUrl directly, treat it as an opaque token to hand back to " +
         "the user or to a CourtMesh client that knows how to decrypt it. Two distinct 404s: code CASE_NOT_FOUND " +
         "means no case matches the given id at all; code PDF_NOT_STORED means the case exists but has no stored " +
@@ -668,7 +667,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       title: "Request Case Timeline",
       description:
         "Reads or refreshes the order and hearing history for a case. No AI credits consumed. case_id must be " +
-        "the 24 character MongoDB ObjectId string, the id field from search results, a case number will fail. " +
+        "the 24 character hexadecimal case id, the id field from search results, a case number will fail. " +
         "By default (refresh omitted or false) this is a STORED read: 1 credit, meta.liveFetch is false, and it " +
         "never contacts a court portal. Set refresh true to force a LIVE fetch directly from the court's own " +
         "systems instead: 20 credits, meta.liveFetch true, available on PAYG and above only (Free tier returns " +
@@ -688,7 +687,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         case_id: z
           .string()
           .min(1)
-          .describe("24 character MongoDB ObjectId string for the case, from the id field of a search result. A case number will not work here."),
+          .describe("24 character hexadecimal case id for the case, from the id field of a search result. A case number will not work here."),
         refresh: z
           .boolean()
           .optional()
