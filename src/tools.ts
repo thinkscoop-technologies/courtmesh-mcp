@@ -642,11 +642,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     {
       title: "Get Case PDF URL",
       description:
-        "Returns a time limited link to the official judgment PDF for a case. No AI credits consumed. CRITICAL: " +
-        "the returned pdfUrl is an ENCRYPTED, time limited link, not a directly fetchable link, it must be " +
-        "decrypted before use, and it expires after the returned expiresIn seconds " +
-        "(normally 3600). Do not attempt to fetch pdfUrl directly, treat it as an opaque token to hand back to " +
-        "the user or to a CourtMesh client that knows how to decrypt it. Two distinct 404s: code CASE_NOT_FOUND " +
+        "Returns a time limited link to the official judgment PDF for a case. No AI credits consumed. " +
+        "The returned pdfUrl is a directly fetchable HTTPS link on the CourtMesh API host: hand it to the " +
+        "user, or fetch it, and you get the PDF. It needs no API key and no decryption, and it expires after " +
+        "the returned expiresIn seconds (normally 3600). Fetching it costs no credits. Two distinct 404s: code CASE_NOT_FOUND " +
         "means no case matches the given id at all; code PDF_NOT_STORED means the case exists but has no stored " +
         "document, and comes with a hint field suggesting request_case_timeline with refresh:true, which can " +
         "fetch orders for High Court and District Court cases (tribunal documents are not fetchable via this API).",
