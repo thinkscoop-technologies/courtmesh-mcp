@@ -12,7 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, TIMELINE_TIMEOUT_MS, request } from "./client.js";
+import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, LOOKUP_TIMEOUT_MS, TIMELINE_TIMEOUT_MS, request } from "./client.js";
 import { getApiKeyOverride } from "./context.js";
 
 export interface ToolServerOptions {
@@ -449,7 +449,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     },
     async (args): Promise<CallToolResult> => {
       const { id } = args as any;
-      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}` });
+      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}`, timeoutMs: LOOKUP_TIMEOUT_MS });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }
@@ -475,7 +475,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     },
     async (args): Promise<CallToolResult> => {
       const { id } = args as any;
-      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/analysis` });
+      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/analysis`, timeoutMs: LOOKUP_TIMEOUT_MS });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }
@@ -498,7 +498,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     },
     async (args): Promise<CallToolResult> => {
       const { id } = args as any;
-      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/related` });
+      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/related`, timeoutMs: LOOKUP_TIMEOUT_MS });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }
@@ -653,7 +653,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     },
     async (args): Promise<CallToolResult> => {
       const { id } = args as any;
-      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/pdf` });
+      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}/pdf`, timeoutMs: LOOKUP_TIMEOUT_MS });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }

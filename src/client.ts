@@ -21,6 +21,13 @@ function envMs(name: string, fallback: number): number {
 export const DEFAULT_TIMEOUT_MS = envMs("COURTMESH_DEFAULT_TIMEOUT_MS", 120_000);
 
 /**
+ * Timeout for single record lookups by id (get_case, analysis read, related, pdf link). These answer in
+ * well under a second when healthy, so a stall is a fault; failing at 30 seconds beats a chat that
+ * looks frozen for two minutes.
+ */
+export const LOOKUP_TIMEOUT_MS = envMs("COURTMESH_LOOKUP_TIMEOUT_MS", 30_000);
+
+/**
  * Longer timeout for semantic search and consolidated analysis, which can take minutes.
  * Overridable via COURTMESH_LONG_TIMEOUT_MS, same rationale as COURTMESH_DEFAULT_TIMEOUT_MS.
  * Deliberately 630s, not a round 600s: the server side semantic search handler

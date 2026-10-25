@@ -2,6 +2,15 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.4.4
+
+### Fixed
+
+- Single record lookups by id (`get_case`, `get_case_analysis`, `find_related_cases`,
+  `get_case_pdf_url`) now time out after 30 seconds (`COURTMESH_LOOKUP_TIMEOUT_MS`) instead of 120,
+  so an unknown id no longer leaves the chat apparently frozen for two minutes. The underlying
+  API now answers 404 for an unknown id (research change, same release train).
+
 ## 0.4.2
 
 ### Fixed
