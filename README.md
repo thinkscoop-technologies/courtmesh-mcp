@@ -1,6 +1,6 @@
 # @courtmesh/mcp-server
 
-An MCP (Model Context Protocol) server for the CourtMesh public REST API. It gives any MCP capable AI client, Claude Desktop, Claude Code, Cursor, or a custom agent, tools to search and analyze Indian court case law, screen a party name for litigation history, and check corpus coverage: 310M plus case records spanning the Supreme Court, High Courts, District Courts and tribunals.
+An MCP (Model Context Protocol) server for the CourtMesh public REST API. It gives any MCP capable AI client, Cursor, or a custom agent, tools to search and analyze Indian court case law, screen a party name for litigation history, and check corpus coverage: 310M plus case records spanning the Supreme Court, High Courts, District Courts and tribunals.
 
 Built with the official `@modelcontextprotocol/sdk`. MIT licensed.
 
@@ -38,7 +38,7 @@ COURTMESH_API_KEY=cm-your-key-here node dist/index.js
 
 This server supports two transports, chosen at startup:
 
-- **stdio** (default): the standard transport for local MCP clients such as Claude Desktop, Claude Code and Cursor. The client spawns the server process and talks to it over stdin and stdout.
+- **stdio** (default): the standard transport for local MCP clients such as Cursor and other desktop and command line MCP clients. The client spawns the server process and talks to it over stdin and stdout.
 - **Streamable HTTP**: pass `--http` or set `MCP_TRANSPORT=http` to run as a long lived HTTP server, mounted at `/mcp`, suitable for hosting behind a URL such as `mcp.courtmesh.ai/mcp`. A plain `GET /health` route is also available on the HTTP server itself, separate from the `check_api_health` tool, which checks the upstream CourtMesh API instead.
 
 ## Tools
@@ -74,33 +74,9 @@ When a call is served from that cache, the server answers with an `Idempotency-R
 
 ## Configuration examples
 
-### Claude Desktop
+### Any stdio MCP client
 
-Edit `claude_desktop_config.json` (Settings, Developer, Edit Config) and add:
-
-```json
-{
-  "mcpServers": {
-    "courtmesh": {
-      "command": "npx",
-      "args": ["-y", "@courtmesh/mcp-server"],
-      "env": {
-        "COURTMESH_API_KEY": "cm-your-key-here"
-      }
-    }
-  }
-}
-```
-
-### Claude Code
-
-CLI one liner:
-
-```bash
-claude mcp add courtmesh --env COURTMESH_API_KEY=cm-your-key-here -- npx -y @courtmesh/mcp-server
-```
-
-Or add to `.mcp.json` in your project:
+Add this to your client's MCP server configuration (the file name and location vary by client; most use an `mcpServers` object):
 
 ```json
 {

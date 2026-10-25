@@ -3,7 +3,7 @@
  * Entry point for the CourtMesh MCP server.
  *
  * Selects a transport at startup:
- *   - stdio (default): for Claude Desktop, Claude Code, Cursor and other local MCP clients.
+ *   - stdio (default): for Cursor and other local MCP clients.
  *   - Streamable HTTP: pass --http, or set MCP_TRANSPORT=http, to run as a long lived HTTP
  *     server suitable for hosting at a public URL such as mcp.courtmesh.ai/mcp.
  *
