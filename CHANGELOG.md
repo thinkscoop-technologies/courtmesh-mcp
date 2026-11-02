@@ -22,6 +22,9 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 - A 400 whose body has a `code` but no `error` text is no longer reported as a page size problem
   unless the code is `PAGE_LIMIT_EXCEEDED` or `PAGINATION_DEPTH_EXCEEDED`.
 - Webhook management is intentionally not exposed as tools (see the README).
+- Tool descriptions cover the final server behaviour: the `unavailable` item status (taken down cases, case fields null, no events), the daily add allowance per account (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000) alongside the daily limit on unknown CNRs, the 24 hour cooldown after the court has nothing for a CNR (`fetch: true` then answers 404 straight away), `case.tracking_started` arriving after the first fresh check, the newest-20 and 7 day burst rules, opaque cursors and `YYYY-MM-DD` dates.
+- `list_watchlist_cases` accepts `status: "unavailable"`.
+- A 404 `CASE_NOT_FOUND` from a CNR lookup now tells the model not to keep retrying `fetch`.
 
 ## 0.4.4
 

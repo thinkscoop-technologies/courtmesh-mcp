@@ -277,3 +277,47 @@ test('get_case_changes rejects an unknown event type before any request', async 
   await close();
   await api.close();
 });
+
+test('a CNR lookup 404 tells the model the court is not asked again for 24 hours', async () => {
+  const api = await startApi(() => ({
+    status: 404,
+    body: { success: false, error: 'No case with this CNR was found.', code: 'CASE_NOT_FOUND', cnr: CNR, status: 'not_found' },
+  }));
+  const { client, close } = await connect(api.baseUrl);
+  const res = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: CNR, fetch: true } });
+  assert.equal(res.isError, true);
+  assert.match(text(res), /CASE_NOT_FOUND/);
+  assert.match(text(res), /24 hours/);
+  await close();
+  await api.close();
+});
+
+test('list_watchlist_cases accepts the unavailable status and shows null case fields', async () => {
+  const item = {
+    cnr: CNR, reference: 'R1', label: null, status: 'unavailable',
+    caseId: null, court: null, title: null, lastCheckedAt: null, lastChangedAt: null, snapshot: null, addedAt: '2026-11-02T00:00:00.000Z',
+  };
+  const api = await startApi(() => ok([item], { pagination: { nextCursor: null, hasMore: false } }));
+  const { client, close } = await connect(api.baseUrl);
+  const res = await client.callTool({ name: 'list_watchlist_cases', arguments: { watchlist_id: 'wl_1', status: 'unavailable' } });
+  assert.notEqual(res.isError, true);
+  assert.match(api.calls[0].url, /status=unavailable/);
+  assert.match(text(res), /"status": ?"unavailable"/);
+  await close();
+  await api.close();
+});
+
+test('add_cases_to_watchlist returns cap_exceeded and cooldown not_found results as data', async () => {
+  const results = [
+    { cnr: CNR, result: 'cap_exceeded', message: 'The daily limit for adding case numbers has been reached. It resets at midnight IST.' },
+    { cnr: 'DLHC010084212022', result: 'not_found', message: 'eCourts had no such case when we last looked. Try again tomorrow.' },
+  ];
+  const api = await startApi(() => ok({ results, itemCount: 3 }));
+  const { client, close } = await connect(api.baseUrl);
+  const res = await client.callTool({ name: 'add_cases_to_watchlist', arguments: { watchlist_id: 'wl_1', items: [{ cnr: CNR }, { cnr: 'DLHC010084212022' }] } });
+  assert.notEqual(res.isError, true);
+  assert.match(text(res), /cap_exceeded/);
+  assert.match(text(res), /Try again tomorrow/);
+  await close();
+  await api.close();
+});

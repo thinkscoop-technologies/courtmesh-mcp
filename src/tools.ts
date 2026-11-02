@@ -1230,7 +1230,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "arguments; data.requestId is opaque and does not work with get_case_timeline); or, when the CNR is not in " +
         "our records and fetch was not set, a 404 Not found error (a Supreme Court CNR we do not hold is always " +
         "404, it cannot be fetched live). In that last case, ask the user before retrying with fetch true, " +
-        "because a live fetch is limited per day and the record, once it lands, costs 1 credit. Typical flow: call with fetch false; if " +
+        "because a live fetch is limited per day and the record, once it lands, costs 1 credit. If the court " +
+        "already had nothing for this CNR in the last 24 hours, fetch true does not ask it again: the call is a 404 " +
+        "straight away, so do not keep retrying; tell the user to check the CNR or try tomorrow. A case that was " +
+        "taken down at a party's request is not available and is reported as not found. Typical flow: call with fetch false; if " +
         "not found and the user wants it, call again with fetch true; then repeat the call until status is found. " +
         "To be told when this case changes later, add it with add_cases_to_watchlist.",
       inputSchema: {
@@ -1274,15 +1277,19 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Creates a named watchlist and, optionally, starts watching up to 100 cases (by CNR) in it. Monitoring " +
         "means CourtMesh checks every watched case at least once a day and records a change event when " +
         "something happens. FREE: creating a watchlist and watching cases cost no credits; the daily checks are " +
-        "included. Limits per account: a cap on total watched cases (Free 10, Pay As You Go 1,000, Scale 10,000, " +
-        "Enterprise by contract) and at most 50 watchlists, so reuse an existing watchlist (list_watchlists) rather " +
+        "included. Limits per account: a cap on total distinct watched cases (Free 10, Pay As You Go 1,000, Scale 10,000, " +
+        "Enterprise by contract), a daily allowance on how many cases can be added (Free 50, Pay As You Go 5,000, " +
+        "Scale 50,000, Enterprise 500,000, resetting at midnight IST) and at most 50 watchlists, so reuse an existing watchlist (list_watchlists) rather " +
         "than creating a new one for every case. Each CNR in items gets a result: watching (already in our records), " +
         "pending (not in our records yet, so a live fetch was started and it will become watching), invalid (not a " +
-        "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap, or over the daily limit on " +
-        "adding cases we do not hold yet: Free 20, Pay As You Go 500, Scale 5,000) or not_found (the court has no " +
-        "such case, or a Supreme Court CNR we do not hold). Cases that end up not_found still count toward the cap " +
-        "until removed. A partial success is still a success: read the per item results. The first check of a " +
-        "case produces one case.tracking_started event with its current state, not a flood of historical events. " +
+        "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap, over the daily add " +
+        "allowance, or over the daily limit on adding cases we do not hold yet: Free 20, Pay As You Go 500, Scale " +
+        "5,000; the item message says which) or not_found (the court has no such case, the court had nothing for " +
+        "it in the last 24 hours so it is not asked again until tomorrow, the case was taken down at a party's " +
+        "request, or a Supreme Court CNR we do not hold). Cases that end up not_found still count toward the cap " +
+        "until removed. A partial success is still a success: read the per item results. Each case produces one " +
+        "case.tracking_started event with its current state once its first fresh check completes (straight away if " +
+        "our record is already current), not a flood of historical events, so it can arrive a little after the add. " +
         "Read changes later with get_case_changes.",
       inputSchema: {
         name: z.string().trim().min(1).max(100).describe("Watchlist name, 1 to 100 characters, for example Loan book or Client matters."),
@@ -1335,12 +1342,16 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "included, subject to the account's watched case cap. Each CNR gets a result: watching (already in our " +
         "records), pending (not in our records yet, so a live fetch was started; it becomes watching when the case " +
         "lands), invalid (not a valid CNR), duplicate (already on this list), cap_exceeded (the account is at its " +
-        "watched case cap or its daily limit on adding cases we do not hold yet, so remove cases you no longer need " +
-        "with remove_case_from_watchlist, or retry tomorrow) or not_found (the court has no such case, or a Supreme " +
-        "Court CNR we do not hold). A case that is not_found still counts toward the cap until removed. If the cap " +
+        "watched case cap, its daily add allowance (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000) " +
+        "or its daily limit on adding cases we do not hold yet, so remove cases you no longer need " +
+        "with remove_case_from_watchlist, or retry tomorrow; the item message says which) or not_found (the court " +
+        "has no such case, the court had nothing for it in the last 24 hours so it is not asked again until " +
+        "tomorrow, the case was taken down at a party's request, or a Supreme Court CNR we do not hold). A case " +
+        "that is not_found still counts toward the cap until removed. If the cap " +
         "is already full and you send a new CNR the call fails with 403 WATCH_CAP_EXCEEDED. A partial success is still a success: always read the per item results and " +
-        "tell the user about any that were not watching or pending. Adding a case produces a case.tracking_started " +
-        "event with its current state; later changes (new orders, hearing date, status, stage, disposal) are read " +
+        "tell the user about any that were not watching or pending. Each watched case produces a " +
+        "case.tracking_started event with its current state once its first fresh check completes (straight away " +
+        "if our record is already current); later changes (new orders, hearing date, status, stage, disposal) are read " +
         "with get_case_changes. Repeating a call is safe: already watched cases are reported as duplicate.",
       inputSchema: {
         watchlist_id: watchlistIdParam,
@@ -1391,15 +1402,18 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       title: "List Watchlist Cases",
       description:
         "Lists the cases on one watchlist with their current monitoring state. FREE, no credits. Each item has: " +
-        "cnr, reference and label (the caller's own), status (watching, pending, not_found or error), caseId, " +
+        "cnr, reference and label (the caller's own), status (watching, pending, not_found, error or unavailable), caseId, " +
         "court, title, lastCheckedAt, lastChangedAt, addedAt and a snapshot of caseStatus, caseStage, " +
-        "nextHearingDate, lastListedOn, orderCount, latestOrderDate and disposalNature. Use this to answer " +
+        "nextHearingDate, lastListedOn, orderCount, latestOrderDate and disposalNature (dates are YYYY-MM-DD). " +
+        "unavailable means the case was taken down at a party's request: caseId, court, title, snapshot, " +
+        "lastCheckedAt and lastChangedAt are all null and no events are sent, so tell the user it is no longer " +
+        "available rather than treating the nulls as missing data. Use this to answer " +
         "\"what is the next hearing date for everything I am watching\" without reading the change feed. Filter " +
         "with status, for example pending to see which cases are still being fetched. Results are paginated: if " +
         "the result mentions a next page cursor, pass it back as cursor.",
       inputSchema: {
         watchlist_id: watchlistIdParam,
-        status: z.enum(["watching", "pending", "not_found", "error"]).optional().describe("Only items with this status."),
+        status: z.enum(["watching", "pending", "not_found", "error", "unavailable"]).optional().describe("Only items with this status."),
         limit: z.number().int().min(1).max(100).optional().describe("Items per page, 1 to 100."),
         cursor: z.string().trim().optional().describe("The pagination.nextCursor from a previous call, passed back unmodified."),
       },
@@ -1431,8 +1445,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "createdAt, cnr, caseId, the watchlists it belongs to (with the caller's reference) and data (for example " +
         "previous and current values, plus a snapshot of the case). To get only what is new since the last " +
         "call, pass back pagination.nextCursor as cursor: it is returned even when the page is empty, so always " +
-        "remember the latest one. With no cursor, pass since (an ISO timestamp, such as the start of today) to bound " +
-        "the history, otherwise you start from the oldest retained event; events are kept for 90 days. If " +
+        "remember the latest one; cursors are opaque, so never build or edit one. With no cursor, pass since (an ISO " +
+        "timestamp, such as the start of today) to bound the history, otherwise you start from the oldest retained " +
+        "event; events are kept for 90 days and appear in the feed about 2 seconds after they happen. case.tracking_started " +
+        "is sent after a case's first fresh check, not at the moment it is added. When many orders arrive at once " +
+        "only the newest 20 are announced, and an order dated more than 7 days before watching began is never " +
+        "announced. Dates are YYYY-MM-DD. A case taken down at a party's request sends no events. If " +
         "pagination.hasMore is true there is another page, which costs another credit: fetch it only if you need it. " +
         "Pass watchlist_id to restrict to one watchlist, and types or cnr to narrow further, which keeps the cost " +
         "down.",

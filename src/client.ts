@@ -268,6 +268,14 @@ function describeNotFoundError(body: any): string {
   }
   const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" ? codeGuidance(body.code) : undefined;
   if (guidance) parts.push(guidance);
+  // A CNR lookup that found nothing (the body carries the cnr and status "not_found"). After a
+  // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.
+  if (body?.code === "CASE_NOT_FOUND" && body?.status === "not_found" && typeof body?.cnr === "string") {
+    parts.push(
+      "This CNR is not in our records. If a live fetch was already tried and the court had nothing, the court is not " +
+        "asked again for 24 hours, so retrying with fetch true will not help until tomorrow. Check the CNR with the user."
+    );
+  }
   return parts.join(" ");
 }
 
