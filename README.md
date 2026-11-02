@@ -48,7 +48,7 @@ This server supports two transports, chosen at startup:
 | `search_indian_court_cases` | `POST /search/cases` | No | Fast keyword and boolean search over the full 310M plus case index. |
 | `semantic_search_cases` | `POST /search/cases/semantic` | Yes | AI vector search over the roughly 2M case subset with embeddings, for natural language questions about legal concepts. |
 | `get_case` | `GET /cases/{id}` | No | Full case details, without AI analysis. |
-| `get_case_analysis` | `GET /cases/{id}/analysis` | No | Reads any existing AI analysis for a case, read only. |
+| `get_case_analysis` | `GET /cases/{id}/analysis` | Yes | Reads any existing AI analysis for a case, read only. 1 credit per read; the first read of a case by your organization costs the credits generating that analysis used. |
 | `find_related_cases` | `GET /cases/{id}/related` | No | Other documents sharing the same case number, plus a procedural timeline. |
 | `search_judges` | `GET /judges/search` | No | Autocomplete over Supreme Court and High Court judge names. |
 | `analyze_case` | `POST /cases/{id}/analyze` | Yes | Triggers AI analysis of one case, asynchronous. `allowRemoteFetch: true` permits fetching the source document from a remote court host, at a 20 credit surcharge. |
