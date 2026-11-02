@@ -54,7 +54,7 @@ This server supports two transports, chosen at startup:
 | `analyze_case` | `POST /cases/{id}/analyze` | Yes | Triggers AI analysis of one case, asynchronous. `allowRemoteFetch: true` permits fetching the source document from a remote court host, at a 20 credit surcharge. |
 | `analyze_consolidated_case` | `POST /cases/{id}/analyze-consolidated` | Yes, more | AI analysis merged across every document sharing a case number, synchronous and slow. |
 | `get_case_pdf_url` | `GET /cases/{id}/pdf` | No | A time limited, encrypted link to the official judgment PDF. |
-| `request_case_timeline` | `POST /request-timeline` | No, unless `refresh: true` | Reads stored order and hearing history by default (1 credit); `refresh: true` forces a live fetch from the court's own systems (20 credits, PAYG tier or above). |
+| `request_case_timeline` | `POST /request-timeline` | No, unless `refresh: true` | Reads stored order and hearing history by default (1 credit); `refresh: true` forces a live fetch from the court's own systems (also 1 credit, PAYG tier or above). |
 | `get_case_timeline` | `GET /get-timeline/{requestId}` | No | Polls the job started by `request_case_timeline`. |
 | `screen_party_litigation` | `POST /party/screen` | Yes | Litigation check for a person or company name: KYC, BGV, due diligence, and litigation/compliance screening. |
 | `get_court_coverage` | `GET /coverage` | No | Corpus coverage and freshness snapshot, no authentication required. |
@@ -63,8 +63,21 @@ This server supports two transports, chosen at startup:
 | `list_reference_courts` | `GET /reference/courts` | No | The court taxonomy accepted by `court` filters elsewhere, no authentication required. |
 | `list_reference_case_types` | `GET /reference/case-types` | No | Every `caseType` value accepted elsewhere, no authentication required. |
 | `screen_party_litigation_batch` | `POST /party/screen/batch` | Yes | Screens up to 25 names in one call, same check as `screen_party_litigation`; each item independently priced and independently able to fail. Not available on the Free tier, no adjudicate option. |
+| `lookup_case_by_cnr` | `GET /cases/by-cnr/{cnr}` | 1 credit when a record is returned | Finds one case from its 16 character CNR. `fetch: true` starts a live court fetch for a CNR not in our records yet (1 credit, shares the daily live fetch cap). |
+| `create_watchlist` | `POST /watchlists` | No | Creates a watchlist and optionally starts watching up to 100 CNRs. Daily monitoring is included in your plan, within the watched case cap. |
+| `list_watchlists` | `GET /watchlists` | No | Lists the account's watchlists. |
+| `add_cases_to_watchlist` | `POST /watchlists/{id}/items` | No | Starts watching 1 to 100 CNRs, with a per case result (watching, pending, invalid, duplicate, cap_exceeded, not_found). |
+| `remove_case_from_watchlist` | `DELETE /watchlists/{id}/items/{cnr}` | No | Stops watching one CNR. |
+| `list_watchlist_cases` | `GET /watchlists/{id}/items` | No | The cases on a watchlist with their current snapshot (status, stage, next hearing date, order count). |
+| `get_case_changes` | `GET /changes`, `GET /watchlists/{id}/events` | 1 credit per non-empty page | The change feed: new orders, hearing date, status, stage and disposal changes. An empty page is free, so polling is cheap. |
 
-18 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+25 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+
+### Monitoring a set of cases
+
+Ask the model to watch cases by CNR ("watch DLHC010084212021 and DLHC010084222021 for me"); it creates or reuses a watchlist with `create_watchlist` and `add_cases_to_watchlist`. Later, "what changed on my cases since yesterday" is answered by `get_case_changes`, which returns only new events when you carry its `pagination.nextCursor` forward. Webhook management is intentionally not exposed as a tool: webhooks send account data to a URL and their signing secret is shown once, so set them up in code with the [Node](https://github.com/thinkscoop-technologies/courtmesh-node) or [Python](https://github.com/thinkscoop-technologies/courtmesh-python) SDK instead.
+
+The monitoring tools do not send an `Idempotency-Key`: adding a case that is already watched is simply reported as `duplicate`, so a retry is safe without one.
 
 ### Idempotency
 

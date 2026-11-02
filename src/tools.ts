@@ -14,6 +14,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, LOOKUP_TIMEOUT_MS, TIMELINE_TIMEOUT_MS, request } from "./client.js";
 import { getApiKeyOverride } from "./context.js";
+import { cnrForRequest } from "./cnr.js";
 
 export interface ToolServerOptions {
   baseUrl: string;
@@ -73,7 +74,7 @@ function paginationNote(pagination: any): string | undefined {
 async function callApi(
   opts: ToolServerOptions,
   reqOpts: {
-    method?: "GET" | "POST";
+    method?: "GET" | "POST" | "PATCH" | "DELETE";
     path: string;
     query?: Record<string, any>;
     body?: unknown;
@@ -669,7 +670,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "the 24 character hexadecimal case id, the id field from search results, a case number will fail. " +
         "By default (refresh omitted or false) this is a STORED read: 1 credit, meta.liveFetch is false, and it " +
         "never contacts a court portal. Set refresh true to force a LIVE fetch directly from the court's own " +
-        "systems instead: 20 credits, meta.liveFetch true, available on PAYG and above only (Free tier returns " +
+        "systems instead: still 1 credit, meta.liveFetch true, available on PAYG and above only (Free tier returns " +
         "HTTP 403 LIVE_FETCH_NOT_ALLOWED), and subject to a per tier daily cap (HTTP 429 " +
         "LIVE_FETCH_LIMIT_REACHED once exhausted, with a Retry-After telling you when it resets). Supreme Court " +
         "cases return immediately with status completed and orderCount 0, since SC cases have no separate order " +
@@ -692,7 +693,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .optional()
           .describe(
             "Default false: a stored-only read, 1 credit, meta.liveFetch false, never touches a court portal. " +
-              "Set true to force a live fetch from the court's own systems: 20 credits, meta.liveFetch true, " +
+              "Set true to force a live fetch from the court's own systems: also 1 credit, meta.liveFetch true, " +
               "PAYG tier or above only (403 LIVE_FETCH_NOT_ALLOWED on Free), and capped per day per tier (429 " +
               "LIVE_FETCH_LIMIT_REACHED once exhausted)."
           ),
@@ -1170,18 +1171,311 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
   );
 
   // ---------------------------------------------------------------------------
-  // Deliberately NOT implemented here: watchlist and webhook tools.
+  // CNR lookup and case monitoring (0.5.0)
   //
-  // The backend plan (Phase M2) adds POST/GET/DELETE watchlist endpoints and
-  // webhook subscription management on top of party/screen. Both are stateful
-  // (they create and own server side resources tied to the caller's account)
-  // and billable (watchlist events and webhook deliveries carry their own
-  // credit cost once shipped). An MCP tool call is a one-shot, fire-and-forget
-  // action with no confirmation step and no per-call cost visible to the
-  // calling model ahead of time, which is the wrong shape for "create a
-  // standing subscription that keeps charging me" or "register a URL that
-  // will receive my data going forward". Add these only once M2 ships, and
-  // only with an explicit confirmation/cost-preview step, not as a plain
-  // registerTool alongside the read-only and single-shot tools above.
+  // Seven tools: one lookup, five watchlist tools and the change feed. Webhook
+  // management is deliberately NOT exposed. A webhook is a standing instruction
+  // to send account data to a URL, its signing secret is shown once and would
+  // land in the chat transcript, and a URL planted by text the model read (a
+  // prompt injection in a document) is a data exfiltration path. Webhooks are
+  // set up once by a developer in code or the dashboard; an agent that needs
+  // changes reads get_case_changes instead. None of the watchlist tools send an
+  // Idempotency-Key: a replayed "add" after a "remove" within 24 hours would
+  // silently do nothing. Adding is naturally idempotent (a repeat reports
+  // "duplicate"), so a retry is safe without one.
   // ---------------------------------------------------------------------------
+
+  const cnrParam = z
+    .string()
+    .trim()
+    .min(1)
+    .describe(
+      "A CNR (Case Number Record), the 16 character national case identifier, for example DLHC010084212021. " +
+        "Common spellings are accepted and tidied for you: lower case, spaces, hyphens, slashes and a leading " +
+        '"CNR:" or "CNR No" label are all fine.'
+    );
+
+  const watchlistIdParam = z
+    .string()
+    .trim()
+    .min(1)
+    .describe("Watchlist id, starts with wl_. Get ids from list_watchlists or from create_watchlist.");
+
+  const watchItemSchema = z.object({
+    cnr: cnrParam,
+    reference: z
+      .string()
+      .max(200)
+      .optional()
+      .describe("Your own id for this case, up to 200 characters, for example a loan number. It is echoed back on every change event for the case."),
+    label: z.string().max(200).optional().describe("A short display label, up to 200 characters."),
+  });
+
+  function normalizeItems(items: Array<{ cnr: string; reference?: string; label?: string }>) {
+    return items.map((item) => ({ ...item, cnr: cnrForRequest(item.cnr) }));
+  }
+
+  // 19. lookup_case_by_cnr ----------------------------------------------
+  server.registerTool(
+    "lookup_case_by_cnr",
+    {
+      title: "Look Up Case By CNR",
+      description:
+        "Finds one case from its CNR (the 16 character national case number record, for example " +
+        "DLHC010084212021). Use this when the user gives you a CNR; use search_indian_court_cases for names, " +
+        "citations or keywords. COSTS 1 CREDIT, charged only when a case record is actually returned; not found and " +
+        "pending cost nothing. The result's data.status is one of: found (data.case is the full case record, " +
+        "same shape as get_case, including caseStatus, caseStage, nextHearingDate, lastListedOn and orderCount); " +
+        "pending (a live fetch from the court is running: wait a few seconds and call this tool again with the same " +
+        "arguments, or poll get_case_timeline with data.requestId); or, when the CNR is not in our records and fetch " +
+        "was not set, a 404 Not found error. In that last case, ask the user before retrying with fetch true, " +
+        "because a live fetch costs 1 credit and is limited per day. Typical flow: call with fetch false; if " +
+        "not found and the user wants it, call again with fetch true; then repeat the call until status is found. " +
+        "To be told when this case changes later, add it with add_cases_to_watchlist.",
+      inputSchema: {
+        cnr: cnrParam,
+        fetch: z
+          .boolean()
+          .optional()
+          .describe(
+            "Default false. Set true only if a previous call said the CNR is not found: starts a live fetch from " +
+              "the court's own system for a case we do not hold yet. 1 credit once the fetch is accepted, and it shares " +
+              "the per day live fetch cap with request_case_timeline refresh (HTTP 429 LIVE_FETCH_LIMIT_REACHED once " +
+              "exhausted). Returns status pending; call again shortly."
+          ),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { cnr, fetch } = args as any;
+      const result = await callApi(opts, {
+        method: "GET",
+        path: `cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
+        query: fetch ? { fetch: "true" } : undefined,
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      const status = result.data?.data?.status;
+      const note =
+        status === "pending"
+          ? "The live fetch is still running. Call lookup_case_by_cnr again with the same arguments in a few seconds."
+          : undefined;
+      return envelopeResult(result.data, note);
+    }
+  );
+
+  // 20. create_watchlist ------------------------------------------------
+  server.registerTool(
+    "create_watchlist",
+    {
+      title: "Create Watchlist",
+      description:
+        "Creates a named watchlist and, optionally, starts watching up to 100 cases (by CNR) in it. Monitoring " +
+        "means CourtMesh checks every watched case at least once a day and records a change event when " +
+        "something happens. FREE: creating a watchlist and watching cases cost no credits; the daily checks are " +
+        "included. Limits per account: a cap on total watched cases (Free 10, Pay As You Go 1,000, Scale 10,000, " +
+        "Enterprise by contract) and at most 50 watchlists, so reuse an existing watchlist (list_watchlists) rather " +
+        "than creating a new one for every case. Each CNR in items gets a result: watching (already in our records), " +
+        "pending (not in our records yet, so a live fetch was started and it will become watching), invalid (not a " +
+        "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap) or not_found (the court " +
+        "has no such case). A partial success is still a success: read the per item results. The first check of a " +
+        "case produces one case.tracking_started event with its current state, not a flood of historical events. " +
+        "Read changes later with get_case_changes.",
+      inputSchema: {
+        name: z.string().trim().min(1).max(100).describe("Watchlist name, 1 to 100 characters, for example Loan book or Client matters."),
+        items: z
+          .array(watchItemSchema)
+          .max(100)
+          .optional()
+          .describe("Up to 100 cases to start watching. More can be added later with add_cases_to_watchlist."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { name, items } = args as any;
+      const body: Record<string, unknown> = { name };
+      if (items !== undefined) body.items = normalizeItems(items);
+      const result = await callApi(opts, { method: "POST", path: "watchlists", body, timeoutMs: LOOKUP_TIMEOUT_MS });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 21. list_watchlists -------------------------------------------------
+  server.registerTool(
+    "list_watchlists",
+    {
+      title: "List Watchlists",
+      description:
+        "Lists this account's watchlists: id (starts with wl_), name, itemCount, createdAt, updatedAt and metadata. " +
+        "FREE, no credits. Call this first to find an existing watchlist id before creating a new watchlist. " +
+        "Results are paginated: if the result mentions a next page cursor, pass it back as cursor to get more.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(100).optional().describe("Watchlists per page, 1 to 100."),
+        cursor: z.string().trim().optional().describe("The pagination.nextCursor from a previous call, passed back unmodified."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { limit, cursor } = args as any;
+      const result = await callApi(opts, { method: "GET", path: "watchlists", query: { limit, cursor }, timeoutMs: LOOKUP_TIMEOUT_MS });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 22. add_cases_to_watchlist ------------------------------------------
+  server.registerTool(
+    "add_cases_to_watchlist",
+    {
+      title: "Add Cases To Watchlist",
+      description:
+        "Starts watching 1 to 100 cases (by CNR) on an existing watchlist. FREE, no credits; daily checks are " +
+        "included, subject to the account's watched case cap. Each CNR gets a result: watching (already in our " +
+        "records), pending (not in our records yet, so a live fetch was started; it becomes watching when the case " +
+        "lands), invalid (not a valid CNR), duplicate (already on this list), cap_exceeded (the account is at its " +
+        "watched case cap, so remove cases you no longer need with remove_case_from_watchlist) or not_found " +
+        "(the court has no such case). A partial success is still a success: always read the per item results and " +
+        "tell the user about any that were not watching or pending. Adding a case produces a case.tracking_started " +
+        "event with its current state; later changes (new orders, hearing date, status, stage, disposal) are read " +
+        "with get_case_changes. Repeating a call is safe: already watched cases are reported as duplicate.",
+      inputSchema: {
+        watchlist_id: watchlistIdParam,
+        items: z.array(watchItemSchema).min(1).max(100).describe("The cases to watch, 1 to 100."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { watchlist_id, items } = args as any;
+      const result = await callApi(opts, {
+        method: "POST",
+        path: `watchlists/${encodeURIComponent(watchlist_id)}/items`,
+        body: { items: normalizeItems(items) },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 23. remove_case_from_watchlist --------------------------------------
+  server.registerTool(
+    "remove_case_from_watchlist",
+    {
+      title: "Remove Case From Watchlist",
+      description:
+        "Stops watching one case on one watchlist. FREE, no credits. This frees one slot of the account's watched " +
+        "case cap if no other watchlist watches the same CNR. Change events already recorded for the case stay " +
+        "readable in get_case_changes. Only call this when the user has asked to stop watching that case.",
+      inputSchema: { watchlist_id: watchlistIdParam, cnr: cnrParam },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { watchlist_id, cnr } = args as any;
+      const result = await callApi(opts, {
+        method: "DELETE",
+        path: `watchlists/${encodeURIComponent(watchlist_id)}/items/${encodeURIComponent(cnrForRequest(cnr))}`,
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      return textResult(result.data === undefined || result.data === null ? { success: true, removed: true } : result.data);
+    }
+  );
+
+  // 24. list_watchlist_cases --------------------------------------------
+  server.registerTool(
+    "list_watchlist_cases",
+    {
+      title: "List Watchlist Cases",
+      description:
+        "Lists the cases on one watchlist with their current monitoring state. FREE, no credits. Each item has: " +
+        "cnr, reference and label (the caller's own), status (watching, pending, not_found or error), caseId, " +
+        "court, title, lastCheckedAt, lastChangedAt, addedAt and a snapshot of caseStatus, caseStage, " +
+        "nextHearingDate, lastListedOn, orderCount, latestOrderDate and disposalNature. Use this to answer " +
+        "\"what is the next hearing date for everything I am watching\" without reading the change feed. Filter " +
+        "with status, for example pending to see which cases are still being fetched. Results are paginated: if " +
+        "the result mentions a next page cursor, pass it back as cursor.",
+      inputSchema: {
+        watchlist_id: watchlistIdParam,
+        status: z.enum(["watching", "pending", "not_found", "error"]).optional().describe("Only items with this status."),
+        limit: z.number().int().min(1).max(100).optional().describe("Items per page, 1 to 100."),
+        cursor: z.string().trim().optional().describe("The pagination.nextCursor from a previous call, passed back unmodified."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { watchlist_id, status, limit, cursor } = args as any;
+      const result = await callApi(opts, {
+        method: "GET",
+        path: `watchlists/${encodeURIComponent(watchlist_id)}/items`,
+        query: { status, limit, cursor },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      return envelopeResult(result.data);
+    }
+  );
+
+  // 25. get_case_changes ------------------------------------------------
+  server.registerTool(
+    "get_case_changes",
+    {
+      title: "Get Case Changes",
+      description:
+        "Reads the change feed for the cases this account is watching: new orders, hearing date changes, status " +
+        "and stage changes, disposals, and tracking started or case not found events. Oldest first. COSTS 1 CREDIT " +
+        "per page that has at least one event (up to 100 events per page); an empty page is free, so polling " +
+        "when nothing has changed costs nothing. Each event has id, type (case.tracking_started, case.order_added, " +
+        "case.hearing_date_changed, case.status_changed, case.stage_changed, case.disposed, case.not_found), " +
+        "createdAt, cnr, caseId, the watchlists it belongs to (with the caller's reference) and data (for example " +
+        "previous and current values, plus a snapshot of the case). To get only what is new since the last " +
+        "call, pass back pagination.nextCursor as cursor: it is returned even when the page is empty, so always " +
+        "remember the latest one. With no cursor, pass since (an ISO timestamp, such as the start of today) to bound " +
+        "the history, otherwise you start from the oldest retained event; events are kept for 90 days. If " +
+        "pagination.hasMore is true there is another page, which costs another credit: fetch it only if you need it. " +
+        "Pass watchlist_id to restrict to one watchlist, and types or cnr to narrow further, which keeps the cost " +
+        "down.",
+      inputSchema: {
+        watchlist_id: watchlistIdParam.optional().describe("Only events for this watchlist. Omit for all watchlists."),
+        since: z
+          .string()
+          .trim()
+          .optional()
+          .describe("ISO 8601 timestamp, for example 2026-11-01T00:00:00Z. Used only when no cursor is given."),
+        cursor: z.string().trim().optional().describe("The pagination.nextCursor from a previous call, passed back unmodified. Takes priority over since."),
+        types: z
+          .array(
+            z.enum([
+              "case.tracking_started",
+              "case.order_added",
+              "case.hearing_date_changed",
+              "case.status_changed",
+              "case.stage_changed",
+              "case.disposed",
+              "case.not_found",
+            ])
+          )
+          .optional()
+          .describe("Only these event types. Omit for all."),
+        cnr: cnrParam.optional().describe("Only events for this CNR."),
+        limit: z.number().int().min(1).max(100).optional().describe("Events per page, 1 to 100, default 100."),
+      },
+    },
+    async (args): Promise<CallToolResult> => {
+      const { watchlist_id, since, cursor, types, cnr, limit } = args as any;
+      const result = await callApi(opts, {
+        method: "GET",
+        path: watchlist_id ? `watchlists/${encodeURIComponent(watchlist_id)}/events` : "changes",
+        query: {
+          since,
+          cursor,
+          types: Array.isArray(types) ? types.join(",") : types,
+          cnr: cnr === undefined ? undefined : cnrForRequest(cnr),
+          limit,
+        },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
+      if (!result.ok) return errorResult(result.message);
+      const next = result.data?.pagination?.nextCursor;
+      const note =
+        typeof next === "string" && next.length > 0
+          ? "Remember pagination.nextCursor: pass it back as cursor next time to read only newer events."
+          : undefined;
+      return envelopeResult(result.data, note);
+    }
+  );
 }

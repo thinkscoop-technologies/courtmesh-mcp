@@ -2,6 +2,25 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.5.0
+
+### Added
+
+- Seven tools for CNR lookup and case monitoring: `lookup_case_by_cnr`, `create_watchlist`,
+  `list_watchlists`, `add_cases_to_watchlist`, `remove_case_from_watchlist`, `list_watchlist_cases`
+  and `get_case_changes` (25 tools in total). CNRs are tidied client side (case, spaces, hyphens,
+  a leading `CNR:` label) before they are sent.
+- `DELETE` and `PATCH` support in the HTTP client.
+- Error guidance for `INVALID_CNR`, `WATCHLIST_NOT_FOUND`, `WATCH_CAP_EXCEEDED` and
+  `WATCHLIST_LIMIT_REACHED`.
+
+### Changed
+
+- `request_case_timeline` with `refresh: true` is documented at 1 credit (it was 20).
+- A 400 whose body has a `code` but no `error` text is no longer reported as a page size problem
+  unless the code is `PAGE_LIMIT_EXCEEDED` or `PAGINATION_DEPTH_EXCEEDED`.
+- Webhook management is intentionally not exposed as tools (see the README).
+
 ## 0.4.4
 
 ### Fixed

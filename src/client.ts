@@ -60,7 +60,7 @@ export interface ClientOptions {
 }
 
 export interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
@@ -133,6 +133,14 @@ function codeGuidance(code: string | undefined): string | undefined {
       return "Too many different API keys have been used from this network address today. Wait for the daily reset, or contact CourtMesh support if this is unexpected.";
     case "CURSOR_INVALID":
       return "Start the search again without a cursor rather than editing or reusing an old one.";
+    case "INVALID_CNR":
+      return "A CNR is 16 characters, for example DLHC010084212021. Spaces, hyphens and a leading CNR label are fine.";
+    case "WATCHLIST_NOT_FOUND":
+      return "Call list_watchlists to see the ids of the watchlists on this account.";
+    case "WATCH_CAP_EXCEEDED":
+      return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
+    case "WATCHLIST_LIMIT_REACHED":
+      return "This account has reached its watchlist limit. Reuse an existing watchlist (list_watchlists) instead of creating a new one.";
     default:
       return undefined;
   }
@@ -154,7 +162,7 @@ function describeValidationError(status: number, body: any): string {
   // search/cases and search/cases/semantic) carry no "error" or "details" field, only "code",
   // "limit" and "tier". Falling back to the generic "Validation failed" text for this shape used
   // to suggest the request body was malformed, when the real problem is a plan limit.
-  if (typeof body?.error !== "string" && typeof code === "string") {
+  if (typeof body?.error !== "string" && (code === "PAGE_LIMIT_EXCEEDED" || code === "PAGINATION_DEPTH_EXCEEDED")) {
     const limit = typeof body?.limit === "number" ? body.limit : "unknown";
     const tier = typeof body?.tier === "string" ? body.tier : "unknown";
     return (
@@ -166,7 +174,8 @@ function describeValidationError(status: number, body: any): string {
   const baseMessage: string =
     typeof body?.error === "string" ? body.error : (typeof body?.message === "string" ? body.message : "Validation failed. Please check your request and try again.");
   const detailText = details.length > 0 ? `\nDetails:\n- ${details.join("\n- ")}` : "";
-  return `Request rejected (400): ${baseMessage}${detailText}`;
+  const guidance = code === "INVALID_CNR" ? codeGuidance(code) : undefined;
+  return `Request rejected (400): ${baseMessage}${code === "INVALID_CNR" ? ` Code: ${code}.` : ""}${guidance ? ` ${guidance}` : ""}${detailText}`;
 }
 
 function describeAuthError(body: any): string {
