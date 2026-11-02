@@ -1227,9 +1227,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "pending cost nothing. The result's data.status is one of: found (data.case is the full case record, " +
         "same shape as get_case, including caseStatus, caseStage, nextHearingDate, lastListedOn and orderCount); " +
         "pending (a live fetch from the court is running: wait a few seconds and call this tool again with the same " +
-        "arguments, or poll get_case_timeline with data.requestId); or, when the CNR is not in our records and fetch " +
-        "was not set, a 404 Not found error. In that last case, ask the user before retrying with fetch true, " +
-        "because a live fetch costs 1 credit and is limited per day. Typical flow: call with fetch false; if " +
+        "arguments; data.requestId is opaque and does not work with get_case_timeline); or, when the CNR is not in " +
+        "our records and fetch was not set, a 404 Not found error (a Supreme Court CNR we do not hold is always " +
+        "404, it cannot be fetched live). In that last case, ask the user before retrying with fetch true, " +
+        "because a live fetch is limited per day and the record, once it lands, costs 1 credit. Typical flow: call with fetch false; if " +
         "not found and the user wants it, call again with fetch true; then repeat the call until status is found. " +
         "To be told when this case changes later, add it with add_cases_to_watchlist.",
       inputSchema: {
@@ -1239,7 +1240,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .optional()
           .describe(
             "Default false. Set true only if a previous call said the CNR is not found: starts a live fetch from " +
-              "the court's own system for a case we do not hold yet. 1 credit once the fetch is accepted, and it shares " +
+              "the court's own system for a case we do not hold yet. The call that starts the fetch is free and returns " +
+              "pending; the later call that returns the record costs 1 credit, and a fetch the court cannot satisfy is free. It shares " +
               "the per day live fetch cap with request_case_timeline refresh (HTTP 429 LIVE_FETCH_LIMIT_REACHED once " +
               "exhausted). Returns status pending; call again shortly."
           ),
@@ -1276,8 +1278,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Enterprise by contract) and at most 50 watchlists, so reuse an existing watchlist (list_watchlists) rather " +
         "than creating a new one for every case. Each CNR in items gets a result: watching (already in our records), " +
         "pending (not in our records yet, so a live fetch was started and it will become watching), invalid (not a " +
-        "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap) or not_found (the court " +
-        "has no such case). A partial success is still a success: read the per item results. The first check of a " +
+        "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap, or over the daily limit on " +
+        "adding cases we do not hold yet: Free 20, Pay As You Go 500, Scale 5,000) or not_found (the court has no " +
+        "such case, or a Supreme Court CNR we do not hold). Cases that end up not_found still count toward the cap " +
+        "until removed. A partial success is still a success: read the per item results. The first check of a " +
         "case produces one case.tracking_started event with its current state, not a flood of historical events. " +
         "Read changes later with get_case_changes.",
       inputSchema: {
@@ -1331,8 +1335,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "included, subject to the account's watched case cap. Each CNR gets a result: watching (already in our " +
         "records), pending (not in our records yet, so a live fetch was started; it becomes watching when the case " +
         "lands), invalid (not a valid CNR), duplicate (already on this list), cap_exceeded (the account is at its " +
-        "watched case cap, so remove cases you no longer need with remove_case_from_watchlist) or not_found " +
-        "(the court has no such case). A partial success is still a success: always read the per item results and " +
+        "watched case cap or its daily limit on adding cases we do not hold yet, so remove cases you no longer need " +
+        "with remove_case_from_watchlist, or retry tomorrow) or not_found (the court has no such case, or a Supreme " +
+        "Court CNR we do not hold). A case that is not_found still counts toward the cap until removed. If the cap " +
+        "is already full and you send a new CNR the call fails with 403 WATCH_CAP_EXCEEDED. A partial success is still a success: always read the per item results and " +
         "tell the user about any that were not watching or pending. Adding a case produces a case.tracking_started " +
         "event with its current state; later changes (new orders, hearing date, status, stage, disposal) are read " +
         "with get_case_changes. Repeating a call is safe: already watched cases are reported as duplicate.",
@@ -1361,7 +1367,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       title: "Remove Case From Watchlist",
       description:
         "Stops watching one case on one watchlist. FREE, no credits. This frees one slot of the account's watched " +
-        "case cap if no other watchlist watches the same CNR. Change events already recorded for the case stay " +
+        "case cap (the cap counts every case on every watchlist). A CNR that is not on that watchlist is a 404 " +
+        "ITEM_NOT_FOUND. Change events already recorded for the case stay " +
         "readable in get_case_changes. Only call this when the user has asked to stop watching that case.",
       inputSchema: { watchlist_id: watchlistIdParam, cnr: cnrParam },
     },

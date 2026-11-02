@@ -63,11 +63,11 @@ This server supports two transports, chosen at startup:
 | `list_reference_courts` | `GET /reference/courts` | No | The court taxonomy accepted by `court` filters elsewhere, no authentication required. |
 | `list_reference_case_types` | `GET /reference/case-types` | No | Every `caseType` value accepted elsewhere, no authentication required. |
 | `screen_party_litigation_batch` | `POST /party/screen/batch` | Yes | Screens up to 25 names in one call, same check as `screen_party_litigation`; each item independently priced and independently able to fail. Not available on the Free tier, no adjudicate option. |
-| `lookup_case_by_cnr` | `GET /cases/by-cnr/{cnr}` | 1 credit when a record is returned | Finds one case from its 16 character CNR. `fetch: true` starts a live court fetch for a CNR not in our records yet (1 credit, shares the daily live fetch cap). |
+| `lookup_case_by_cnr` | `GET /cases/by-cnr/{cnr}` | 1 credit when a record is returned | Finds one case from its 16 character CNR. `fetch: true` starts a live court fetch for a CNR not in our records yet: the starting call returns `pending` and is free, the call that returns the record is the 1 credit charge, and the fetch shares the daily live fetch cap. Call again with the same CNR to poll. |
 | `create_watchlist` | `POST /watchlists` | No | Creates a watchlist and optionally starts watching up to 100 CNRs. Daily monitoring is included in your plan, within the watched case cap. |
 | `list_watchlists` | `GET /watchlists` | No | Lists the account's watchlists. |
 | `add_cases_to_watchlist` | `POST /watchlists/{id}/items` | No | Starts watching 1 to 100 CNRs, with a per case result (watching, pending, invalid, duplicate, cap_exceeded, not_found). |
-| `remove_case_from_watchlist` | `DELETE /watchlists/{id}/items/{cnr}` | No | Stops watching one CNR. |
+| `remove_case_from_watchlist` | `DELETE /watchlists/{id}/items/{cnr}` | No | Stops watching one CNR (404 `ITEM_NOT_FOUND` if it is not on the list). |
 | `list_watchlist_cases` | `GET /watchlists/{id}/items` | No | The cases on a watchlist with their current snapshot (status, stage, next hearing date, order count). |
 | `get_case_changes` | `GET /changes`, `GET /watchlists/{id}/events` | 1 credit per non-empty page | The change feed: new orders, hearing date, status, stage and disposal changes. An empty page is free, so polling is cheap. |
 

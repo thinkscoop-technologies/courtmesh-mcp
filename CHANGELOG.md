@@ -16,6 +16,8 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 
 ### Changed
 
+- `lookup_case_by_cnr` with `fetch: true`: the starting call returns `pending` and is free, the call that returns the record is the one 1 credit charge; `requestId` is opaque and is not used with `get_case_timeline`.
+- Tool descriptions state the daily limit on adding unknown CNRs, that a Supreme Court CNR we do not hold is not found at once, and `ITEM_NOT_FOUND`.
 - `request_case_timeline` with `refresh: true` is documented at 1 credit (it was 20).
 - A 400 whose body has a `code` but no `error` text is no longer reported as a page size problem
   unless the code is `PAGE_LIMIT_EXCEEDED` or `PAGINATION_DEPTH_EXCEEDED`.

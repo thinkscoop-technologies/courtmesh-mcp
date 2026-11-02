@@ -1,7 +1,7 @@
 /**
  * Client side CNR normalisation, the same rule the CourtMesh API applies:
  * trim, uppercase, remove spaces, hyphens, slashes, dots and colons, drop a
- * leading CNR, CNR: or CNR NO label. A valid CNR is 16 characters: a 6
+ * leading CNR, CNR:, CNR NO or CNR NUMBER label. A valid CNR is 16 characters: a 6
  * character establishment code beginning with a 2 letter state code, 6 serial
  * digits and a 4 digit year. The API is the authority; this only tidies input
  * before it is sent.
@@ -12,7 +12,8 @@ export function normalizeCnr(input: unknown): string | null {
   if (typeof input !== "string") return null;
   let value = input.trim().toUpperCase().replace(/[\s\-/.:]+/g, "");
   if (!CNR_PATTERN.test(value)) {
-    if (value.startsWith("CNRNO")) value = value.slice(5);
+    if (value.startsWith("CNRNUMBER")) value = value.slice(9);
+    else if (value.startsWith("CNRNO")) value = value.slice(5);
     else if (value.startsWith("CNR")) value = value.slice(3);
   }
   return CNR_PATTERN.test(value) ? value : null;

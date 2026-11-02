@@ -137,6 +137,8 @@ function codeGuidance(code: string | undefined): string | undefined {
       return "A CNR is 16 characters, for example DLHC010084212021. Spaces, hyphens and a leading CNR label are fine.";
     case "WATCHLIST_NOT_FOUND":
       return "Call list_watchlists to see the ids of the watchlists on this account.";
+    case "ITEM_NOT_FOUND":
+      return "That CNR is not on this watchlist. Call list_watchlist_cases to see what is on it.";
     case "WATCH_CAP_EXCEEDED":
       return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
     case "WATCHLIST_LIMIT_REACHED":
@@ -264,6 +266,8 @@ function describeNotFoundError(body: any): string {
   if (typeof body?.hint === "string") {
     parts.push(body.hint);
   }
+  const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" ? codeGuidance(body.code) : undefined;
+  if (guidance) parts.push(guidance);
   return parts.join(" ");
 }
 
