@@ -134,11 +134,11 @@ function codeGuidance(code: string | undefined): string | undefined {
     case "CURSOR_INVALID":
       return "Start the search again without a cursor rather than editing or reusing an old one.";
     case "INVALID_CNR":
-      return "A CNR is 16 characters, for example DLHC010084212021. Spaces, hyphens and a leading CNR label are fine.";
+      return "Spaces, hyphens and a leading CNR label are fine; any other change to the 16 characters is not.";
     case "WATCHLIST_NOT_FOUND":
       return "Call list_watchlists to see the ids of the watchlists on this account.";
     case "ITEM_NOT_FOUND":
-      return "That CNR is not on this watchlist. Call list_watchlist_cases to see what is on it.";
+      return "Call list_watchlist_cases to see what is on it.";
     case "WATCH_CAP_EXCEEDED":
       return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
     case "WATCHLIST_LIMIT_REACHED":
@@ -272,7 +272,7 @@ function describeNotFoundError(body: any): string {
   // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.
   if (body?.code === "CASE_NOT_FOUND" && body?.status === "not_found" && typeof body?.cnr === "string") {
     parts.push(
-      "This CNR is not in our records. If a live fetch was already tried and the court had nothing, the court is not " +
+      "If a live fetch was already tried and the court had nothing, the court is not " +
         "asked again for 24 hours, so retrying with fetch true will not help until tomorrow. Check the CNR with the user."
     );
   }
