@@ -462,8 +462,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
     {
       title: "Get Case Analysis",
       description:
-        "Reads any existing AI analysis for a case. Read only: does NOT trigger new analysis and does NOT consume " +
-        "AI credits. If analysis has not been generated yet, hasAnalysis will be false and you will get a message " +
+        "Reads any existing AI analysis for a case. Read only: does NOT trigger new analysis. Costs 1 credit per " +
+        "read, except the first time your organization reads a given case's analysis, which costs the credits " +
+        "generating that analysis used (up to 400). If analysis has not been generated yet, hasAnalysis will be false and you will get a message " +
         "field instead of an analysis field; in that case call analyze_case to generate it. When hasAnalysis is " +
         "true, analysis may include summary, detailedSummary, comprehensiveSummary, headnote, holding, keyFacts, " +
         "issues, courtsReasoning, citedCases (followed, distinguished, overruled, referred), " +
@@ -538,7 +539,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "stored data (see allowRemoteFetch). ASYNCHRONOUS: normally returns immediately with status processing " +
         "while the analysis runs in the background; poll get_case_analysis after roughly 30 to 60 seconds to " +
         "retrieve the result. If analysis already exists and force is not set, the existing analysis is returned " +
-        "immediately instead with alreadyExists true, at no extra charge. Set force true to re-analyze a case " +
+        "immediately instead with alreadyExists true, priced as a read of it rather than a new analysis: 1 credit, or " +
+        "the generation credits the first time your organization reads that case. Set force true to re-analyze a case " +
         "that already has analysis, which also consumes credits again. Fails with a clear message if the case " +
         "has no usable text or PDF content to analyze. Free tier note: this tool, analyze_consolidated_case, and " +
         "reading analysis on the free tier all return HTTP 403 API_TIER_NOT_ALLOWED with an upgrade URL; the " +
