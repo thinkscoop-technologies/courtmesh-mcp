@@ -2,6 +2,15 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.6.0
+
+### Added
+
+- Five tools: `list_case_orders`, `get_order_text`, `refresh_case_by_cnr`, `get_case_refresh_state` and
+  `refresh_cases_batch` (30 tools in total). `get_order_text` returns long documents in parts, and marks
+  the result as third party content.
+- `include` on `get_case` and `lookup_case_by_cnr`: hearing history and advocates, at no extra charge.
+
 ## 0.5.0
 
 ### Added

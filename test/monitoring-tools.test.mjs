@@ -68,7 +68,7 @@ test('the seven monitoring tools are listed with substantive descriptions', asyn
   const api = await startApi(() => ok({}));
   const { client, close } = await connect(api.baseUrl);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 25);
+  assert.equal(tools.length, 30);
   for (const name of NEW_TOOLS) {
     const tool = tools.find((t) => t.name === name);
     assert.ok(tool, `${name} is registered`);
@@ -85,6 +85,63 @@ test('normalizeCnr handles common spellings', () => {
   assert.equal(normalizeCnr('cnr no dlhc010084212021'), CNR);
   assert.equal(normalizeCnr('nope'), null);
   assert.equal(cnrForRequest('  nope '), 'nope');
+});
+
+test('get_case and lookup_case_by_cnr pass include; without it nothing is sent', async () => {
+  const api = await startApi(() => ok({ id: 'c1', cnr: CNR, status: 'found' }));
+  const { client, close } = await connect(api.baseUrl);
+  await client.callTool({ name: 'get_case', arguments: { id: 'c1' } });
+  await client.callTool({ name: 'get_case', arguments: { id: 'c1', include: ['hearings', 'advocates'] } });
+  await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: CNR, include: ['hearings'] } });
+  assert.equal(api.calls[0].url, '/api/v1/prod/cases/c1');
+  assert.equal(decodeURIComponent(api.calls[1].url), '/api/v1/prod/cases/c1?include=hearings,advocates');
+  assert.equal(api.calls[2].url, `/api/v1/prod/cases/by-cnr/${CNR}?include=hearings`);
+  await close();
+  await api.close();
+});
+
+test('get_order_text: a bad id fails before any call; long text comes in parts, marked as third party', async () => {
+  const body = 'x'.repeat(45_000);
+  const api = await startApi(() => ok({ caseId: 'c1', documentId: 'a'.repeat(24), textAvailable: true, text: body, textLength: body.length }));
+  const { client, close } = await connect(api.baseUrl);
+  const bad = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: '{"$ne":null}' } });
+  assert.ok(bad.isError);
+  assert.equal(api.calls.length, 0);
+  const first = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24) } });
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/c1/orders/${'a'.repeat(24)}/text`);
+  assert.equal(first._meta.provenance.untrusted_content, true);
+  assert.match(text(first), /"next_offset": 30000/);
+  assert.match(text(first), /offset 30000/);
+  const second = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24), offset: 30000 } });
+  assert.match(text(second), /"next_offset": null/);
+  await close();
+  await api.close();
+});
+
+test('get_order_text: no stored text passes the flags through and is not marked as content', async () => {
+  const api = await startApi(() => ok({ caseId: 'c1', documentId: 'a'.repeat(24), textAvailable: false, text: null, textLength: 0 }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24) } });
+  assert.ok(!result.isError);
+  assert.match(text(result), /"textAvailable": false/);
+  assert.equal(result._meta.provenance.untrusted_content, false);
+  await close();
+  await api.close();
+});
+
+test('refresh tools send the canonical CNR, and the batch normalises every entry', async () => {
+  const api = await startApi(() => ({ status: 202, body: { success: true, data: { cnr: CNR, status: 'queued', results: [] } } }));
+  const { client, close } = await connect(api.baseUrl);
+  await client.callTool({ name: 'refresh_case_by_cnr', arguments: { cnr: 'cnr: dlhc-01-008421-2021' } });
+  assert.equal(api.calls[0].method, 'POST');
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${CNR}/refresh`);
+  await client.callTool({ name: 'get_case_refresh_state', arguments: { cnr: CNR } });
+  assert.equal(api.calls[1].method, 'GET');
+  await client.callTool({ name: 'refresh_cases_batch', arguments: { cnrs: ['dlhc-01-008421-2021'] } });
+  assert.equal(api.calls[2].url, '/api/v1/prod/cases/refresh/batch');
+  assert.deepEqual(api.calls[2].body, { cnrs: [CNR] });
+  await close();
+  await api.close();
 });
 
 test('lookup_case_by_cnr normalises the CNR and returns found', async () => {
