@@ -14,7 +14,23 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { CourtMeshApiError, DEFAULT_TIMEOUT_MS, LONG_TIMEOUT_MS, LOOKUP_TIMEOUT_MS, TIMELINE_TIMEOUT_MS, request } from "./client.js";
 import { getApiKeyOverride } from "./context.js";
-import { cnrForRequest } from "./cnr.js";
+import { cnrForRequest, normalizeCnr } from "./cnr.js";
+import {
+  CHECK_MAX_DAYS,
+  COURT_KEY_PATTERN,
+  LISTINGS_MAX_DAYS,
+  MATTER_ID_PATTERN,
+  MAX_RESULT_CHARS,
+  PROVENANCE_NOTE,
+  UNTRUSTED_META,
+  CHECK_REPLAY_BUCKET_MS,
+  compactCheckData,
+  defaultCheckRange,
+  describeRemaining,
+  cnrDatesProblem,
+  dateRangeProblems,
+  isIsoDate,
+} from "./cause-lists.js";
 
 export interface ToolServerOptions {
   baseUrl: string;
@@ -32,6 +48,8 @@ export interface ToolServerOptions {
    * happened.
    */
   sessionSalt: string;
+  /** Clock in milliseconds since the epoch. Tests only; defaults to Date.now. */
+  now?: () => number;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +98,7 @@ async function callApi(
     body?: unknown;
     timeoutMs?: number;
     idempotencyKey?: string;
+    signal?: AbortSignal;
   }
 ): Promise<{ ok: true; data: any } | { ok: false; message: string }> {
   try {
@@ -1503,6 +1522,358 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           ? "Remember pagination.nextCursor: pass it back as cursor next time to read only newer events."
           : undefined;
       return envelopeResult(result.data, note);
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Cause lists
+  //
+  // Four tools: listings of the account's matters, listings of one matter, the
+  // published list of one court, and the check of watched CNRs. Every result
+  // carries _meta.provenance.untrusted_content because the text comes from
+  // court lists. Only listings that were found are ever reported: an empty
+  // result is never a statement that a case is absent from a list.
+  // ---------------------------------------------------------------------------
+
+  // Read only, but every call is charged: a repeat is not free, so idempotentHint is false.
+  const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
+  const clock = () => (opts.now ? opts.now() : Date.now());
+
+  const dateParam = (name: string, extra: string) =>
+    z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, `${name} must be a date written YYYY-MM-DD.`)
+      .optional()
+      .describe(`${name === "from" ? "First" : "Last"} date, YYYY-MM-DD (Indian calendar). ${extra}`);
+
+  const NOT_PROOF =
+    "An empty result or a missing row is NOT proof that a case is not listed: say what was read and suggest confirming " +
+    "against the court's own list when it matters. Never tell the user a case is not listed.";
+
+  const COURT_LIST_CACHE_MS = 5 * 60_000;
+  const courtListCache = new Map<string, { body: any; expires: number }>();
+
+  const untrusted = (result: CallToolResult): CallToolResult => ({ ...result, _meta: UNTRUSTED_META });
+
+  function invalid(problems: string[]): CallToolResult {
+    return errorResult(
+      `Request rejected before sending: ${problems.join(" ")} Fix the field values and call again; repeating the same call will fail the same way.`
+    );
+  }
+
+  // 26. list_cause_listings -----------------------------------------------
+  server.registerTool(
+    "list_cause_listings",
+    {
+      title: "List Cause List Listings",
+      description:
+        "Lists the hearing listings found on court cause lists for the matters in this account (My Cases), within " +
+        "a date range of at most 31 days (default: today and the next 7 days). Each listing has id, matterId, " +
+        "matterTitle, date, courtKey (usable with get_court_cause_list), court (name, courtNo, judges), item, section, " +
+        "purpose, listType, stage, caseText (the case number as written on the list; null on a related_key match), matchedBy (cnr, diary, key or related_key), " +
+        "relation (set when the item is an application or connected case rather than the matter itself), fetchedAt " +
+        "and firstSeenAt. COSTS 1 CREDIT per successful call; a failed call is not charged. Needs the causelist API key " +
+        "scope and an account with cause lists enabled. Paginated: pages start at 1; when the result says more " +
+        "results are available, call again with the next page. " + NOT_PROOF + " " + PROVENANCE_NOTE,
+      inputSchema: {
+        from: dateParam("from", "Send together with to, or omit both."),
+        to: dateParam("to", `At most ${LISTINGS_MAX_DAYS} days after from.`),
+        page: z.number().int().min(1).max(100000).optional().describe("Page number, from 1. Default 1."),
+        limit: z.number().int().min(1).max(100).optional().describe("Listings per page, 1 to 100 and no more than the plan's page size cap. Default: the lower of 50 and the plan's page size cap."),
+      },
+      annotations: READ_ONLY,
+    },
+    async (args, extra): Promise<CallToolResult> => {
+      const { from, to, page, limit } = args as any;
+      const problems = dateRangeProblems(from, to, LISTINGS_MAX_DAYS);
+      if (problems.length > 0) return invalid(problems);
+      const result = await callApi(opts, {
+        method: "GET",
+        path: "cause-lists/listings",
+        query: { from, to, page, limit },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+        signal: extra?.signal,
+      });
+      if (!result.ok) return errorResult(result.message);
+      const p = result.data?.pagination;
+      const nextPage = p?.hasMore && typeof p.page === "number" ? p.page + 1 : undefined;
+      const notes = [
+        nextPage !== undefined ? `More results are available: call list_cause_listings again with page ${nextPage} and the same dates and limit.` : undefined,
+        Array.isArray(result.data?.data) && result.data.data.length === 0
+          ? `No listings were found for ${from && to ? `${from} to ${to}` : "the default range (today and the next 7 days)"} among the matters in this account. This does not show that no matter is listed.`
+          : undefined,
+        PROVENANCE_NOTE,
+      ].filter((n): n is string => Boolean(n));
+      const out = envelopeResult(result.data, notes.join("\n"));
+      const size = (out.content[0] as any).text.length;
+      if (size > MAX_RESULT_CHARS) {
+        const half = Math.max(1, Math.floor((limit ?? 50) / 2));
+        return errorResult(
+          `result_too_large: this page is too large to return whole. Call list_cause_listings again with limit ${half}` +
+            `${from && to ? `, from ${from}, to ${to}` : ""}${page ? `, page ${page}` : ""}. The page was charged; the smaller call is charged again.`
+        );
+      }
+      return untrusted(out);
+    }
+  );
+
+  // 27. list_matter_cause_listings ----------------------------------------
+  server.registerTool(
+    "list_matter_cause_listings",
+    {
+      title: "List Cause List Listings For A Matter",
+      description:
+        "Lists the hearing listings found for ONE matter in this account (My Cases), within a date range of at most " +
+        "31 days (default: today and the next 7 days). matter_id is the 24 character hexadecimal id of the matter " +
+        "(the matterId on a listing from list_cause_listings). Returns the matter (id, title, courtKey) and its " +
+        "listings in the same shape as list_cause_listings. COSTS 1 CREDIT per successful call; an unknown matter, " +
+        "an account without cause list access or a temporary outage is not charged. Needs the causelist API key scope. " +
+        NOT_PROOF + " " + PROVENANCE_NOTE,
+      inputSchema: {
+        matter_id: z
+          .string()
+          .trim()
+          .regex(MATTER_ID_PATTERN, "matter_id must be a 24 character hexadecimal id.")
+          .describe("The 24 character hexadecimal id of the matter."),
+        from: dateParam("from", "Send together with to, or omit both."),
+        to: dateParam("to", `At most ${LISTINGS_MAX_DAYS} days after from.`),
+      },
+      annotations: READ_ONLY,
+    },
+    async (args, extra): Promise<CallToolResult> => {
+      const { matter_id, from, to } = args as any;
+      const problems = dateRangeProblems(from, to, LISTINGS_MAX_DAYS);
+      if (problems.length > 0) return invalid(problems);
+      const result = await callApi(opts, {
+        method: "GET",
+        path: `matters/${encodeURIComponent(matter_id)}/cause-listings`,
+        query: { from, to },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+        signal: extra?.signal,
+      });
+      if (!result.ok) return errorResult(result.message);
+      const empty = Array.isArray(result.data?.data?.listings) && result.data.data.listings.length === 0;
+      const notes = [
+        empty
+          ? `No listings were found for this matter in ${from && to ? `${from} to ${to}` : "the default range (today and the next 7 days)"}. This does not show that the matter is not listed.`
+          : undefined,
+        PROVENANCE_NOTE,
+      ].filter((n): n is string => Boolean(n));
+      const out = envelopeResult(result.data, notes.join("\n"));
+      if ((out.content[0] as any).text.length > MAX_RESULT_CHARS) {
+        return errorResult(
+          "result_too_large: this matter has too many listings in the range to return whole. Call list_matter_cause_listings again with a shorter from to range (for example 7 days). The call was charged; the smaller call is charged again."
+        );
+      }
+      return untrusted(out);
+    }
+  );
+
+  // 28. get_court_cause_list ----------------------------------------------
+  server.registerTool(
+    "get_court_cause_list",
+    {
+      title: "Get Court Cause List",
+      description:
+        "Reads the published cause list of one court for one date, for a court where this account has an open " +
+        "matter. court_key is `SC`, `HC:<state>:<bench>` or `DC:<state>:<district>:<complex>:<establishment>:<court number>` " +
+        "(digits only); use the courtKey of a listing from list_cause_listings. data.status says what was read: ok and " +
+        "partial carry rows (partial means some parts of the list could not be read; complete says whether every part " +
+        "was); none, empty, not_published, invalid_court and unavailable carry no rows. COSTS 1 CREDIT only when status " +
+        "is ok or partial; every other status is a 200 that costs 0 (meta.creditsCharged says so), though the call " +
+        "needs 1 credit available when it starts. A court with no open matter of yours is a 404 COURT_LIST_NOT_FOUND, " +
+        "not charged. A list can have thousands of rows: rows are returned in pages of limit (default 200, max 500) " +
+        "from offset, and the result gives rowsTotal and nextOffset (null when done); later pages of the same list read " +
+        "within 5 minutes in this session are not charged again. Each row has item, section, " +
+        "purpose, listType, courtNo, courtName, judges, caseText, caseType, caseNumber, caseYear, cnr, diary fields, " +
+        "petitioner, respondent, advocates, stage and related items; a restricted row has no party or advocate " +
+        "fields. Needs the causelist API key scope. status empty or unavailable, or a row you do not see, is NOT proof " +
+        "that a case is not listed. " + PROVENANCE_NOTE,
+      inputSchema: {
+        court_key: z
+          .string()
+          .trim()
+          .regex(COURT_KEY_PATTERN, "court_key must be SC, HC:<state>:<bench> or DC:<state>:<district>:<complex>:<establishment>:<court number>, digits only.")
+          .describe("SC, HC:<state>:<bench> or DC:<state>:<district>:<complex>:<establishment>:<court number>, digits only. Example: DC:99:1:9900001:1:1."),
+        date: z
+          .string()
+          .trim()
+          .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be a date written YYYY-MM-DD.")
+          .describe("Date of the list, YYYY-MM-DD (Indian calendar)."),
+        offset: z.number().int().min(0).max(1_000_000).optional().describe("Row to start from, default 0. Use nextOffset from the previous call."),
+        limit: z.number().int().min(1).max(500).optional().describe("Rows per call, 1 to 500, default 200."),
+      },
+      annotations: READ_ONLY,
+    },
+    async (args, extra): Promise<CallToolResult> => {
+      const { court_key, date, offset, limit } = args as any;
+      if (!isIsoDate(date)) return invalid(["date: date must be a real date written YYYY-MM-DD."]);
+      // Later pages of a list already paid for in this session are served from memory: re-calling the
+      // API for every page of rows would charge 1 credit each time for the same list.
+      const cacheKey = createHash("sha256")
+        .update(`${opts.sessionSalt}:${getApiKeyOverride() ?? opts.apiKey ?? ""}:${court_key}:${date}`)
+        .digest("hex");
+      const now = clock();
+      for (const [k, v] of courtListCache) if (v.expires <= now) courtListCache.delete(k);
+      const cached = (offset ?? 0) > 0 ? courtListCache.get(cacheKey) : undefined;
+      let result: { ok: true; data: any } | { ok: false; message: string };
+      let fromCache = false;
+      let cacheExpires = 0;
+      if (cached) {
+        // Pages served from this session are free: say so in meta, not just in the text.
+        result = { ok: true, data: { ...cached.body, meta: { ...(cached.body?.meta ?? {}), creditsCharged: 0, servedFromSession: true } } };
+        fromCache = true;
+        cacheExpires = cached.expires;
+      } else {
+        result = await callApi(opts, {
+          method: "GET",
+          path: "cause-lists/court",
+          query: { courtKey: court_key, date },
+          timeoutMs: LOOKUP_TIMEOUT_MS,
+          signal: extra?.signal,
+        });
+        if (result.ok && (result.data?.data?.status === "ok" || result.data?.data?.status === "partial")) {
+          if (courtListCache.size >= 20) courtListCache.delete(courtListCache.keys().next().value as string);
+          cacheExpires = now + COURT_LIST_CACHE_MS;
+          courtListCache.set(cacheKey, { body: result.data, expires: cacheExpires });
+        }
+      }
+      if (!result.ok) return errorResult(result.message);
+      const list = result.data?.data;
+      const allRows: unknown[] = Array.isArray(list?.rows) ? list.rows : [];
+      const start = Math.min(offset ?? 0, allRows.length);
+      let take = limit ?? 200;
+      const build = (n: number) => {
+        const end = Math.min(start + n, allRows.length);
+        const paged = {
+          ...result.data,
+          data: { ...list, rows: allRows.slice(start, end), rowsTotal: allRows.length, rowsOffset: start, nextOffset: end < allRows.length ? end : null },
+        };
+        const notes = [
+          end < allRows.length ? `Rows ${start} to ${end - 1} of ${allRows.length}. Call get_court_cause_list again with the same court_key and date and offset ${end} for the next rows: for ${describeRemaining(cacheExpires - now)} more those are served from this session and are not charged again.` : undefined,
+          fromCache ? `These rows were served from the list already read in this session (meta.servedFromSession); no new charge was made. The stored list stays available for ${describeRemaining(cacheExpires - now)} more.` : undefined,
+          list?.status === "empty" || list?.status === "none" || list?.status === "unavailable" || list?.status === "not_published"
+            ? `Status ${list.status}: no rows were read for this court and date. This does not show that any case is not listed.`
+            : undefined,
+          list && list.complete === false && allRows.length > 0 ? "complete is false: only part of this list was read, so a case missing from these rows may still be on the full list." : undefined,
+          PROVENANCE_NOTE,
+        ].filter((n): n is string => Boolean(n));
+        return envelopeResult(paged, notes.join("\n"));
+      };
+      let out = build(take);
+      while ((out.content[0] as any).text.length > MAX_RESULT_CHARS && take > 1) {
+        take = Math.max(1, Math.floor(take / 2));
+        out = build(take);
+      }
+      return untrusted(out);
+    }
+  );
+
+  // 29. check_cause_list_for_cnrs -----------------------------------------
+  server.registerTool(
+    "check_cause_list_for_cnrs",
+    {
+      title: "Check Watched Cases On Cause Lists",
+      description:
+        "Checks whether 1 to 100 cases (by CNR) that this account WATCHES (see add_cases_to_watchlist) appear on a " +
+        "cause list that CourtMesh already holds, for a range of at most 7 days (default: today and tomorrow, Indian " +
+        "calendar). It never contacts a court: it reads stored lists only. COSTS 1 CREDIT per CNR whose status is " +
+        "listed or no_entry_found, settled once for the whole call; every other status is free. The call also needs at " +
+        "least 1 credit available when it starts: a balance below the number of watched CNRs in it is refused (402). Needs the causelist API key scope. The data has results, summary, and from and to (the dates looked at, including " +
+        "the default range once resolved). Each result has cnr, status, reason, courtKey (null when no court could be " +
+        "identified or the CNR is not watched), dates " +
+        "(per date: date, status, complete, fetchedAt) and listings (date, courtKey, court, item, section, purpose, " +
+        "listType, stage, caseText, matchedBy, relation, fetchedAt; matchedBy is cnr, diary, key or related_key, and " +
+        "courtKey and caseText can be null). Statuses: listed (a row of this case was found; read " +
+        "listings); no_entry_found (a list was read and no row was recognised: this does NOT prove the case is not " +
+        "listed, because the list may be partial (see dates[].complete) or the entry may not be recognisable, so " +
+        "never tell the user the case is not listed, say only that no entry was found in the lists read and that the " +
+        "court's own list should be checked); list_not_read (no list was held for those dates, so nothing is known; for a District Court it can also " +
+        "mean the list of the case's own courtroom could not be confirmed, in which case dates[].status is none); " +
+        "cannot_check (reason says why: pending, record_unavailable, court_not_supported, or a court identification " +
+        "reason: no_case_identity, no_court_key, no_court_number, invalid_court_key, unsupported_court); not_watched (this account does " +
+        "not watch the CNR: add it first). A summary gives the count of each status. Limits: 1 to 100 CNRs, and distinct CNRs " +
+        "(repeats are ignored) times the dates in the range (inclusive; 2 by default) at most 300. A temporary outage is a 502 for the " +
+        "whole call, not charged. A 402 can also arrive after the answer is ready, when the credits due cannot be " +
+        "settled: no results are returned, so check the balance rather than repeating blindly. A 503 with code " +
+        "SETTLEMENT_UNCONFIRMED means the answer was ready but the charge outcome is unknown and no results were " +
+        "returned: do not retry; check the balance (get_api_usage) first, and note that repeating the call with the " +
+        "same Idempotency-Key is refused with 409 IDEMPOTENCY_IN_PROGRESS for up to 24 hours (a call with changed " +
+        "arguments or fresh true is a new request). A 503 ENTITLEMENT_UNAVAILABLE ran nothing and is safe to retry Repeating an identical call within the same 5 minute window in this same session returns the stored " +
+        "result and is not charged again; the result then says it was replayed and may be out of date, and fresh true " +
+        "reads the lists again, charged as above. A call after that window reads the lists again. " + PROVENANCE_NOTE,
+      inputSchema: {
+        cnrs: z.array(z.string().trim().min(1)).min(1).max(100).describe("1 to 100 CNRs, any common spelling (spaces, hyphens, a CNR: label are tidied for you)."),
+        from: dateParam("from", "Send together with to, or omit both for today and tomorrow."),
+        to: dateParam("to", `At most ${CHECK_MAX_DAYS} days after from.`),
+        fresh: freshParam,
+      },
+      annotations: READ_ONLY,
+    },
+    async (args, extra): Promise<CallToolResult> => {
+      const { cnrs, from, to, fresh } = args as any;
+      const problems = dateRangeProblems(from, to, CHECK_MAX_DAYS);
+      if (problems.length > 0) return invalid(problems);
+      const badCnrs = (cnrs as string[])
+        .map((c, i) => (normalizeCnr(c) === null ? `cnrs.${i}: "${String(c).slice(0, 64)}" is not a valid CNR. A CNR has 16 characters, for example ZZAB010000022024.` : undefined))
+        .filter((m): m is string => Boolean(m));
+      if (badCnrs.length > 0) return invalid(badCnrs.slice(0, 5));
+      const limitProblem = cnrDatesProblem(cnrs as string[], from, to);
+      if (limitProblem) return invalid([limitProblem]);
+      const nowMs = clock();
+      // Resolve the default range (today and tomorrow, IST) before hashing, so the key follows the dates
+      // that are actually asked about, and send the resolved dates so the request is explicit.
+      const range = from !== undefined && to !== undefined ? { from, to } : defaultCheckRange(nowMs);
+      const body: Record<string, unknown> = { cnrs: (cnrs as string[]).map(cnrForRequest), from: range.from, to: range.to };
+      // A 5 minute bucket in the key: a repeat inside the bucket replays (no double charge on a retry),
+      // a call in a later bucket is a new request that reads the lists again.
+      const bucket = Math.floor(nowMs / CHECK_REPLAY_BUCKET_MS);
+      const result = await callApi(opts, {
+        method: "POST",
+        path: "cause-lists/check",
+        body,
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+        signal: extra?.signal,
+        idempotencyKey: computeIdempotencyKey(
+          "check_cause_list_for_cnrs",
+          { ...body, bucket },
+          opts.sessionSalt,
+          fresh ? randomUUID() : undefined
+        ),
+      });
+      if (!result.ok) return errorResult(result.message);
+      const notes: string[] = [];
+      if (isReplayed(result.data)) {
+        const wf = result.data?.data?.from ?? range.from;
+        const wt = result.data?.data?.to ?? range.to;
+        notes.push(
+          `Replayed: this result was stored by an identical call a few minutes ago in this session, was not charged again, and may be out of date. It covers ${wf} to ${wt}. Call again with fresh true to read the lists again (charged as above).`
+        );
+      }
+      const summary = result.data?.data?.summary;
+      if (summary && summary.noEntryFound > 0) {
+        notes.push(
+          "no_entry_found does not prove a case is not listed. Report it as: no entry was found in the lists read, and check the court's own list."
+        );
+      }
+      notes.push(PROVENANCE_NOTE);
+      let out = envelopeResult(result.data, notes.join("\n"));
+      if ((out.content[0] as any).text.length > MAX_RESULT_CHARS) {
+        let keep = 3;
+        let compact = compactCheckData(result.data?.data, keep);
+        out = envelopeResult({ ...result.data, data: compact.data }, "");
+        while ((out.content[0] as any).text.length > MAX_RESULT_CHARS && keep > 0) {
+          keep = keep > 1 ? 1 : 0;
+          compact = compactCheckData(result.data?.data, keep);
+          out = envelopeResult({ ...result.data, data: compact.data }, "");
+        }
+        notes.push(
+          `The full result was too large, so per date detail is omitted and at most ${keep} listings are shown per CNR (listingCount gives the real number; ${compact.omittedListings} listings left out). To see everything, call again with fewer CNRs and fresh true; that is charged again.`
+        );
+        out = envelopeResult({ ...result.data, data: compact.data }, notes.join("\n"));
+      }
+      return untrusted(out);
     }
   );
 }

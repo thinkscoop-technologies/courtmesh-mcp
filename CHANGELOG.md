@@ -2,6 +2,16 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## Unreleased
+
+### Added
+
+- Four cause list tools: `list_cause_listings`, `list_matter_cause_listings`, `get_court_cause_list` and `check_cause_list_for_cnrs` (29 tools in total). They need the `causelist` API key scope and an account with cause lists enabled.
+- `check_cause_list_for_cnrs` checks 1 to 100 watched CNRs against stored lists for at most 7 days: 1 credit per CNR with status `listed` or `no_entry_found`, free for `list_not_read`, `cannot_check` and `not_watched`. The description and results state that `no_entry_found` does not prove a case is not listed. It sends an `Idempotency-Key` that includes a 5 minute time bucket and the default dates resolved in India time, so a retry inside the bucket replays and a later call reads the lists again; a replayed result states the dates it covers and that it may be out of date, and `fresh` reads again. The result gives `from` and `to`, the `reason` values and the District Court `list_not_read` note are documented, an invalid CNR and a check over 100 CNRs or over 300 CNRs times dates are rejected before any request, and the late 402 and the 503 `SETTLEMENT_UNCONFIRMED` (charge outcome unknown, do not retry, check the balance) are documented; the pair limit counts distinct CNRs.
+- Matter ids, court keys, dates and CNR counts are validated before any request is sent.
+- Results from the cause list tools carry `_meta.provenance.untrusted_content`; the tools are annotated read only and not idempotent (each call is charged); a court list page served from the session reports `creditsCharged` 0 and `servedFromSession`; a response body that stalls hits the deadline; a cancelled call also stops a 429 back-off wait; a cancelled call aborts the request to the API; oversized results are paged by rows or compacted with counts rather than cut silently.
+- Error guidance for `UPSTREAM_UNAVAILABLE`, `CAUSE_LISTS_NOT_ENABLED`, `MATTER_NOT_FOUND` and `COURT_LIST_NOT_FOUND`.
+
 ## 0.5.0
 
 ### Added

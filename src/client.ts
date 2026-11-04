@@ -79,6 +79,8 @@ export interface RequestOptions {
    * charges or double runs a job.
    */
   idempotencyKey?: string;
+  /** Aborts the call when the MCP client cancels the tool request. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -141,6 +143,16 @@ function codeGuidance(code: string | undefined): string | undefined {
       return "Call list_watchlist_cases to see what is on it.";
     case "WATCH_CAP_EXCEEDED":
       return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
+    case "UPSTREAM_UNAVAILABLE":
+      return "Cause lists are temporarily unavailable and nothing was charged. Waiting a minute and repeating the call once is reasonable; if it fails again, tell the user and stop.";
+    case "SETTLEMENT_UNCONFIRMED":
+      return "The charge outcome for this call is unknown and no results were returned. Do not retry yet: check the balance with get_api_usage first. Repeating the same call is refused with 409 IDEMPOTENCY_IN_PROGRESS for up to 24 hours; tell the user.";
+    case "CAUSE_LISTS_NOT_ENABLED":
+      return "Cause lists are not enabled on this account, so repeating the call will not help. Tell the user.";
+    case "MATTER_NOT_FOUND":
+      return "Use a matterId from a listing returned by list_cause_listings, or check the id with the user. Nothing was charged.";
+    case "COURT_LIST_NOT_FOUND":
+      return "Court lists can only be read for a court where this account has an open matter. Use a courtKey from a listing returned by list_cause_listings. Nothing was charged.";
     case "WATCHLIST_LIMIT_REACHED":
       return "This account has reached its watchlist limit. Reuse an existing watchlist (list_watchlists) instead of creating a new one.";
     default:
@@ -266,7 +278,7 @@ function describeNotFoundError(body: any): string {
   if (typeof body?.hint === "string") {
     parts.push(body.hint);
   }
-  const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" ? codeGuidance(body.code) : undefined;
+  const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" || body?.code === "MATTER_NOT_FOUND" || body?.code === "COURT_LIST_NOT_FOUND" ? codeGuidance(body.code) : undefined;
   if (guidance) parts.push(guidance);
   // A CNR lookup that found nothing (the body carries the cnr and status "not_found"). After a
   // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.
@@ -350,8 +362,26 @@ interface RawAttempt {
  * not be silently replayed by this client), and no other status or code is
  * ever retried.
  */
+/** Sleeps for `ms`, but rejects at once when `signal` aborts, so a cancelled call does not sit out a 429 back-off. */
+function abortableSleep(ms: number, signal: AbortSignal | undefined, method: string, path: string): Promise<void> {
+  const cancelled = () =>
+    new CourtMeshApiError(`The request to the CourtMesh API was cancelled (${method} ${path}) while waiting to retry.`);
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(cancelled());
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancelled());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function request<T = any>(options: ClientOptions & RequestOptions): Promise<T> {
-  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs, idempotencyKey } = options;
+  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs, idempotencyKey, signal } = options;
   const effectiveKey = apiKeyOverride ?? apiKey;
   const url = buildUrl(baseUrl, path, query);
   const timeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -372,8 +402,12 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
+    const onCancel = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", onCancel, { once: true });
 
     let response: Response;
+    let text: string;
     try {
       response = await fetch(url, {
         method,
@@ -381,8 +415,16 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
+      // The timer and the cancellation listener stay alive through the body read: a server that sends
+      // headers and then stalls must still hit the deadline, and a cancel must stop the read.
+      text = await response.text();
     } catch (err: any) {
       clearTimeout(timer);
+      if (signal?.aborted) {
+        throw new CourtMeshApiError(
+          `The request to the CourtMesh API was cancelled (${method} ${path}). If it was a charged call, check usage before repeating it.`
+        );
+      }
       if (err?.name === "AbortError") {
         throw new CourtMeshApiError(
           `Request to CourtMesh API timed out after ${Math.round(timeout / 1000)} seconds (${method} ${path}). ` +
@@ -395,9 +437,9 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
       );
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onCancel);
     }
 
-    const text = await response.text();
     let parsed: any = undefined;
     let jsonParseFailed = false;
     if (text.length > 0) {
@@ -439,7 +481,7 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
           ? bodySeconds
           : 1;
     const delayMs = Math.min(retryAfterSeconds * 1000, MAX_RETRY_DELAY_MS);
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await abortableSleep(delayMs, signal, method, path);
     result = await attempt();
   }
 
