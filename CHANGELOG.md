@@ -16,7 +16,7 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 - Results state when nothing was returned and nothing was charged. An empty citing judgments list is
   returned with a note that it does not mean no judgment applied the provision. A citing page can be short
   or empty while more pages remain; the result then says to follow the cursor.
-- Search, resolve and lookup tools mention their lower per minute limit (429 above it).
+- Search, resolve, lookup and citing list tools mention their lower per minute limit (429 above it).
 
 ## 0.5.0
 

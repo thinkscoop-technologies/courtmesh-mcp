@@ -1858,6 +1858,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Lists judgments recorded as citing exactly one provision, newest first. Use it to find case law on a provision after " +
         "you have both slugs from lookup_section or list_act_sections. A search for section 302 of the Penal Code does not " +
         "return judgments that cite only its successor, so for a repealed act also list the replacing provision. " +
+        TEXT_LIMIT_ADVICE +
         ACTS_COST +
         "This is NOT an exhaustive list of every judgment applying the provision, some matters are never listed, and an EMPTY " +
         "LIST DOES NOT MEAN NO JUDGMENT APPLIED IT: never tell the user a provision has not been judicially considered on " +

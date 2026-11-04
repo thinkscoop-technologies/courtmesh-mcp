@@ -179,7 +179,7 @@ The API's own error text is always surfaced verbatim where available, along with
 
 ### Acts and sections
 
-The nine acts tools need an API key with the `legislation` scope. Each costs 1 credit when something is returned and nothing otherwise. Slugs (`^[a-z0-9][a-z0-9-]*$`) are checked before any request is made, so a malformed one fails at once. Get slugs from `resolve_act`, `search_acts` or `lookup_section` rather than guessing them. Every result carries repeal status; check it before relying on a provision. Statute text is returned as published, with no commentary. `search_acts`, `resolve_act`, `search_sections` and `lookup_section` have a lower per minute limit than other calls and answer 429 above it. A failed check on the citing judgments list answers 502 `UPSTREAM_UNAVAILABLE`, which is safe to retry once.
+The nine acts tools need an API key with the `legislation` scope. Each costs 1 credit when something is returned and nothing otherwise. Slugs (`^[a-z0-9][a-z0-9-]*$`) are checked before any request is made, so a malformed one fails at once. Get slugs from `resolve_act`, `search_acts` or `lookup_section` rather than guessing them. Every result carries repeal status; check it before relying on a provision. Statute text is returned as published, with no commentary. `search_acts`, `resolve_act`, `search_sections`, `lookup_section` and `list_section_citing_cases` have a lower per minute limit than other calls and answer 429 above it. A failed check on the citing judgments list answers 502 `UPSTREAM_UNAVAILABLE`, which is safe to retry once.
 
 When an error body carries a `requestId`, this server appends it to the reported message so it can be handed to CourtMesh support.
 
