@@ -143,6 +143,14 @@ function codeGuidance(code: string | undefined): string | undefined {
       return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
     case "WATCHLIST_LIMIT_REACHED":
       return "This account has reached its watchlist limit. Reuse an existing watchlist (list_watchlists) instead of creating a new one.";
+    case "ACT_NOT_FOUND":
+      return "No published act has this slug. Do not guess slugs: call resolve_act with a short form or name, or search_acts, and use the slug it returns. Nothing was charged.";
+    case "SECTION_NOT_FOUND":
+      return "No published provision has this act and section slug. Call lookup_section with a citation such as section 302 IPC, or list_act_sections for the act, and use the slugs they return. Nothing was charged.";
+    case "UPSTREAM_UNAVAILABLE":
+      return "This is temporary and nothing was charged. It is safe to retry the same call once after a short wait.";
+    case "UPSTREAM_TIMEOUT":
+      return "The search took too long. Try more specific words. Nothing was charged.";
     default:
       return undefined;
   }
@@ -266,7 +274,13 @@ function describeNotFoundError(body: any): string {
   if (typeof body?.hint === "string") {
     parts.push(body.hint);
   }
-  const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" ? codeGuidance(body.code) : undefined;
+  const guidance =
+    body?.code === "WATCHLIST_NOT_FOUND" ||
+    body?.code === "ITEM_NOT_FOUND" ||
+    body?.code === "ACT_NOT_FOUND" ||
+    body?.code === "SECTION_NOT_FOUND"
+      ? codeGuidance(body.code)
+      : undefined;
   if (guidance) parts.push(guidance);
   // A CNR lookup that found nothing (the body carries the cnr and status "not_found"). After a
   // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.

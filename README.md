@@ -70,8 +70,17 @@ This server supports two transports, chosen at startup:
 | `remove_case_from_watchlist` | `DELETE /watchlists/{id}/items/{cnr}` | No | Stops watching one CNR (404 `ITEM_NOT_FOUND` if it is not on the list). |
 | `list_watchlist_cases` | `GET /watchlists/{id}/items` | No | The cases on a watchlist with their current snapshot (status, stage, next hearing date, order count). A case taken down at a party's request shows as `unavailable` with its case fields null. |
 | `get_case_changes` | `GET /changes`, `GET /watchlists/{id}/events` | 1 credit per non-empty page | The change feed: new orders, hearing date, status, stage and disposal changes. An empty page is free, so polling is cheap. |
+| `resolve_act` | `GET /acts/resolve` | 1 credit when something is returned | Turns a short form or name (IPC, NI Act, Cr.P.C.) into up to five candidate acts, best first. |
+| `search_acts` | `GET /acts/search` | 1 credit when something is returned | Finds acts, rules and regulations by title, short form or subject, with filters for kind, jurisdiction and year. |
+| `get_act` | `GET /acts/{slug}` | 1 credit when something is returned | One act's details and repeal status, without its text. |
+| `get_act_history` | `GET /acts/{slug}/history` | 1 credit when something is returned | What repealed an act and what amended it. Act level only: it does not map old sections to new ones. |
+| `list_act_sections` | `GET /acts/{slug}/sections` | 1 credit when something is returned | The table of contents of an act, paged, without provision text. |
+| `get_section` | `GET /acts/{slug}/sections/{sectionSlug}` | 1 credit when something is returned | One provision in full, with structured blocks, amendment notes and repeal status. |
+| `search_sections` | `GET /sections/search` | 1 credit when something is returned | Searches the wording of provisions, optionally within one act or for an exact number. |
+| `lookup_section` | `GET /sections/lookup` | 1 credit when something is returned | Resolves a citation such as section 302 IPC or Article 21 to the provision it names. |
+| `list_section_citing_cases` | `GET /acts/{slug}/sections/{sectionSlug}/citing-cases` | 1 credit when something is returned | Judgments recorded as citing one provision, newest first. Not exhaustive: an empty list does not mean no judgment applied it. |
 
-25 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+34 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
 
 ### Monitoring a set of cases
 
@@ -167,6 +176,10 @@ The API's own error text is always surfaced verbatim where available, along with
 | 400 | Validation failed, or a request shape the plan does not allow: `PAGE_LIMIT_EXCEEDED` / `PAGINATION_DEPTH_EXCEEDED` (the tier's page size or pagination depth cap), `CURSOR_INVALID` (a `cursor` that is malformed, expired, or was issued for a different query). | For a plain validation failure, the tool result lists the specific field errors from the API's `details` array, fix the input and retry. For a cap or cursor problem, reduce `page`/`limit`, drop `cursor` and start the search again, or upgrade the plan. |
 | 404 | The case, PDF, or timeline request was not found. `get_case_pdf_url` distinguishes `CASE_NOT_FOUND` (no such case) from `PDF_NOT_STORED` (case exists, no stored document; try `request_case_timeline` with `refresh: true`). | Double check the id or requestId. |
 | 408 / 500 / 502 / 503 | Timeout or upstream failure. | Usually transient, retry later. |
+
+### Acts and sections
+
+The nine acts tools need an API key with the `legislation` scope. Each costs 1 credit when something is returned and nothing otherwise. Slugs (`^[a-z0-9][a-z0-9-]*$`) are checked before any request is made, so a malformed one fails at once. Get slugs from `resolve_act`, `search_acts` or `lookup_section` rather than guessing them. Every result carries repeal status; check it before relying on a provision. Statute text is returned as published, with no commentary.
 
 When an error body carries a `requestId`, this server appends it to the reported message so it can be handed to CourtMesh support.
 

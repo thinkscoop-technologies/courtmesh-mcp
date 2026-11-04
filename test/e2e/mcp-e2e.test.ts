@@ -55,6 +55,15 @@ const EXPECTED_TOOLS = [
   "remove_case_from_watchlist",
   "list_watchlist_cases",
   "get_case_changes",
+  "search_acts",
+  "resolve_act",
+  "get_act",
+  "get_act_history",
+  "list_act_sections",
+  "get_section",
+  "search_sections",
+  "lookup_section",
+  "list_section_citing_cases",
 ];
 
 // ---------------------------------------------------------------------------
@@ -191,9 +200,9 @@ function lastRequestMatching(pathPattern: RegExp, method?: string) {
 // 1. Handshake, tools/list, schema shape
 // ---------------------------------------------------------------------------
 
-test("stdio: initialize handshake exposes exactly 25 tools with the documented names", async () => {
+test("stdio: initialize handshake exposes exactly 34 tools with the documented names", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 25, `expected 25 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
+  assert.equal(tools.length, 34, `expected 34 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
 });
@@ -900,7 +909,7 @@ test("stdio: an unknown tool name comes back as a clear tool error, not a crash"
 
 test("stdio: the server process survives invalid arguments and keeps answering", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 25, "server must still respond normally after a rejected call");
+  assert.equal(tools.length, 34, "server must still respond normally after a rejected call");
 });
 
 // ---------------------------------------------------------------------------
@@ -929,7 +938,7 @@ test("stdio: an unrecognised (well formed) API key produces a clear 401, not a c
     assert.match(text, /401|Authentication failed/i);
     // Process must still be alive and answering.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 34);
   } finally {
     await handle.close();
   }
@@ -952,7 +961,7 @@ test("stdio: insufficient credits (402) on screen_party_litigation surfaces the 
     assert.match(text, /Shortfall:\s*58/);
     assert.match(text, /Top up at:.*api-keys#credits/);
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25, "process must survive a 402");
+    assert.equal(tools.length, 34, "process must survive a 402");
   } finally {
     await handle.close();
   }
@@ -1230,7 +1239,7 @@ test("stdio: a hanging upstream aborts within the client's own timeout instead o
     assert.match(text, /timed out/i);
     // Process must still be alive and answering after an abort.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 34);
   } finally {
     await handle.close();
   }
@@ -1265,11 +1274,11 @@ test("http: an unauthenticated /mcp request is refused with the documented 401",
   assert.doesNotMatch(JSON.stringify(body), /node_modules|\/Users\//);
 });
 
-test("http: Authorization: Bearer with a valid key connects and lists 25 tools", async () => {
+test("http: Authorization: Bearer with a valid key connects and lists 34 tools", async () => {
   const client = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 34);
   } finally {
     await client.close();
   }
@@ -1279,7 +1288,7 @@ test("http: ?token= query parameter is honoured as an alternative to the header"
   const client = await connectHttpClient(httpMain.baseUrl, { queryToken: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 34);
     const result = await client.callTool({ name: "get_court_coverage", arguments: {} });
     assert.notEqual((result as any).isError, true);
   } finally {

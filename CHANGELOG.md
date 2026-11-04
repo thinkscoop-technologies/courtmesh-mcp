@@ -2,6 +2,20 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.6.0
+
+### Added
+
+- Nine tools for the Acts and sections API: `search_acts`, `resolve_act`, `get_act`, `get_act_history`,
+  `list_act_sections`, `get_section`, `search_sections`, `lookup_section` and
+  `list_section_citing_cases` (34 tools in total). They need an API key with the `legislation` scope and
+  each costs 1 credit when something is returned.
+- Act and section slugs are checked against `^[a-z0-9][a-z0-9-]*$` before any request is sent, so a
+  malformed id fails at once.
+- Error guidance for `ACT_NOT_FOUND`, `SECTION_NOT_FOUND`, `UPSTREAM_UNAVAILABLE` and `UPSTREAM_TIMEOUT`.
+- Results state when nothing was returned and nothing was charged. An empty citing judgments list is
+  returned with a note that it does not mean no judgment applied the provision.
+
 ## 0.5.0
 
 ### Added
