@@ -1,6 +1,6 @@
 # @courtmesh/mcp-server
 
-An MCP (Model Context Protocol) server for the CourtMesh public REST API. It gives any MCP capable AI client, Cursor, or a custom agent, tools to search and analyze Indian court case law, screen a party name for litigation history, and check corpus coverage: 310M plus case records spanning the Supreme Court, High Courts, District Courts and tribunals.
+An MCP (Model Context Protocol) server for the CourtMesh public REST API. It gives any MCP capable AI client, Cursor, or a custom agent, tools to search and analyze Indian court case law, screen a party name for litigation history, and check court coverage. Keyword search across Indian court records.
 
 Built with the official `@modelcontextprotocol/sdk`. MIT licensed.
 
@@ -45,8 +45,8 @@ This server supports two transports, chosen at startup:
 
 | Tool | Endpoint | Credits | One line |
 | --- | --- | --- | --- |
-| `search_indian_court_cases` | `POST /search/cases` | No | Fast keyword and boolean search over the full 310M plus case index. |
-| `semantic_search_cases` | `POST /search/cases/semantic` | Yes | AI vector search over the roughly 2M case subset with embeddings, for natural language questions about legal concepts. |
+| `search_indian_court_cases` | `POST /search/cases` | No | Fast keyword and boolean search across Indian court records. |
+| `semantic_search_cases` | `POST /search/cases/semantic` | Yes | AI search for natural language questions about legal concepts. |
 | `get_case` | `GET /cases/{id}` | No | Full case details, without AI analysis. |
 | `get_case_analysis` | `GET /cases/{id}/analysis` | Yes | Reads any existing AI analysis for a case, read only. 1 credit per read; the first read of a case by your organization costs the credits generating that analysis used. |
 | `find_related_cases` | `GET /cases/{id}/related` | No | Other documents sharing the same case number, plus a procedural timeline. |
@@ -78,7 +78,7 @@ This server supports two transports, chosen at startup:
 | `get_section` | `GET /acts/{slug}/sections/{sectionSlug}` | 1 credit when something is returned | One provision in full, with structured blocks, amendment notes and repeal status. |
 | `search_sections` | `GET /sections/search` | 1 credit when something is returned | Searches the wording of provisions, optionally within one act or for an exact number. |
 | `lookup_section` | `GET /sections/lookup` | 1 credit when something is returned | Resolves a citation such as section 302 IPC or Article 21 to the provision it names. |
-| `list_section_citing_cases` | `GET /acts/{slug}/sections/{sectionSlug}/citing-cases` | 1 credit when something is returned | Judgments recorded as citing one provision, newest first. Not exhaustive: an empty list does not mean no judgment applied it. |
+| `list_section_citing_cases` | `GET /acts/{slug}/sections/{sectionSlug}/citing-cases` | 1 credit when something is returned | Judgments recorded as citing one provision, newest first. Not exhaustive, some matters are never listed, and a page can be short or empty while more pages remain (follow the cursor). An empty list does not mean no judgment applied it. |
 
 34 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
 
@@ -179,7 +179,7 @@ The API's own error text is always surfaced verbatim where available, along with
 
 ### Acts and sections
 
-The nine acts tools need an API key with the `legislation` scope. Each costs 1 credit when something is returned and nothing otherwise. Slugs (`^[a-z0-9][a-z0-9-]*$`) are checked before any request is made, so a malformed one fails at once. Get slugs from `resolve_act`, `search_acts` or `lookup_section` rather than guessing them. Every result carries repeal status; check it before relying on a provision. Statute text is returned as published, with no commentary.
+The nine acts tools need an API key with the `legislation` scope. Each costs 1 credit when something is returned and nothing otherwise. Slugs (`^[a-z0-9][a-z0-9-]*$`) are checked before any request is made, so a malformed one fails at once. Get slugs from `resolve_act`, `search_acts` or `lookup_section` rather than guessing them. Every result carries repeal status; check it before relying on a provision. Statute text is returned as published, with no commentary. `search_acts`, `resolve_act`, `search_sections` and `lookup_section` have a lower per minute limit than other calls and answer 429 above it. A failed check on the citing judgments list answers 502 `UPSTREAM_UNAVAILABLE`, which is safe to retry once.
 
 When an error body carries a `requestId`, this server appends it to the reported message so it can be handed to CourtMesh support.
 

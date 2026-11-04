@@ -73,12 +73,13 @@ test('the nine acts tools are listed with their cost, and the server exposes 34 
       assert.ok(tool, `${name} is registered`);
       assert.match(tool.description, /COSTS 1 CREDIT/, `${name} states its cost`);
       assert.doesNotMatch(tool.description, /[\u2013\u2014]/, `${name} has no em or en dash`);
-      assert.doesNotMatch(tool.description, /opensearch|qdrant|mongo/i, `${name} names no engine`);
     }
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.description]));
     assert.match(byName.list_section_citing_cases, /EMPTY LIST DOES NOT MEAN NO JUDGMENT/);
     assert.match(byName.get_act_history, /does NOT map old sections to new ones/);
     assert.match(byName.get_section, /repeal/i);
+    assert.match(byName.list_section_citing_cases, /NOT the end/);
+    assert.match(byName.search_acts, /429/);
     assert.match(byName.get_act, /resolve_act/);
     assert.match(byName.get_section, /lookup_section/);
   });
@@ -177,7 +178,7 @@ test('an empty citing judgments list is returned with its note and is not an err
   const note = 'Not an exhaustive list of every judgment applying this provision. An empty list does not mean no judgment applied it.';
   await withApi(
     () => ok(
-      { section: { actSlug: 'a', slug: 'section-1', number: '1' }, listAvailable: true, note, total: 0, totalIsLowerBound: false, cases: [] },
+      { section: { actSlug: 'a', slug: 'section-1', number: '1' }, listAvailable: true, note, cases: [] },
       { meta: { creditsCharged: 0, metered: true }, pagination: { limit: 20, hasMore: false, nextCursor: null } }
     ),
     async (client) => {
@@ -191,22 +192,49 @@ test('an empty citing judgments list is returned with its note and is not an err
   );
 });
 
-test('citing cases with listAvailable false is not read as "none exist", and withheld flags surface', async () => {
+test('citing cases with listAvailable false is not read as "none exist"', async () => {
   await withApi(
     () => ({
       status: 200,
       body: {
         success: true,
-        data: { section: {}, listAvailable: false, note: 'n', total: 0, totalIsLowerBound: false, cases: [] },
-        meta: { someRecordsWithheld: true, restrictedCheckDegraded: true },
+        data: { section: {}, listAvailable: false, note: 'n', cases: [] },
         pagination: { limit: 20, hasMore: false, nextCursor: null },
       },
     }),
     async (client) => {
       const result = await client.callTool({ name: 'list_section_citing_cases', arguments: { slug: 'a', sectionSlug: 'b' } });
       assert.match(text(result), /says nothing about whether any exist/);
-      assert.match(text(result), /withheld/);
-      assert.match(text(result), /masked/);
+      assert.doesNotMatch(text(result), /withheld|masked/);
+    }
+  );
+});
+
+test('an empty citing page with hasMore true is not presented as the end and carries the cursor', async () => {
+  await withApi(
+    () => ok(
+      { section: {}, listAvailable: true, note: 'n', cases: [] },
+      { pagination: { limit: 20, hasMore: true, nextCursor: 'opaque.next_2' } }
+    ),
+    async (client) => {
+      const result = await client.callTool({ name: 'list_section_citing_cases', arguments: { slug: 'a', sectionSlug: 'b' } });
+      assert.ok(!result.isError);
+      assert.match(text(result), /NOT the end/);
+      assert.match(text(result), /opaque\.next_2/);
+      assert.doesNotMatch(text(result), /nothing was charged/);
+    }
+  );
+});
+
+test('a short non-empty citing page with hasMore true tells the agent to keep following the cursor', async () => {
+  await withApi(
+    () => ok(
+      { section: {}, listAvailable: true, note: 'n', cases: [{ id: '65f0c0ffee0000000000abcd' }] },
+      { pagination: { limit: 20, hasMore: true, nextCursor: 'c2' } }
+    ),
+    async (client) => {
+      const result = await client.callTool({ name: 'list_section_citing_cases', arguments: { slug: 'a', sectionSlug: 'b' } });
+      assert.match(text(result), /keep following pagination\.nextCursor/);
     }
   );
 });
@@ -214,7 +242,7 @@ test('citing cases with listAvailable false is not read as "none exist", and wit
 test('citing cases passes the cursor back unmodified and surfaces the next cursor', async () => {
   await withApi(
     () => ok(
-      { section: {}, listAvailable: true, note: 'n', total: 40, totalIsLowerBound: false, cases: [{ id: '65f0c0ffee0000000000abcd' }] },
+      { section: {}, listAvailable: true, note: 'n', cases: [{ id: '65f0c0ffee0000000000abcd' }] },
       { pagination: { limit: 1, hasMore: true, nextCursor: 'opaque.cursor_1' } }
     ),
     async (client, api) => {

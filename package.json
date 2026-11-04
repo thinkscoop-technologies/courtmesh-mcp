@@ -1,7 +1,7 @@
 {
   "name": "@courtmesh/mcp-server",
   "version": "0.6.0",
-  "description": "MCP server for the CourtMesh public REST API: search and analyze 310M+ Indian court case records from Supreme Court, High Courts, District Courts and tribunals.",
+  "description": "MCP server for the CourtMesh public REST API: Keyword search across Indian court records.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
