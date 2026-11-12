@@ -105,8 +105,98 @@ test('lookup_case_by_cnr sends fetch=true and explains a pending result', async 
   const { client, close } = await connect(api.baseUrl);
   const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: CNR, fetch: true } });
   assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${CNR}?fetch=true`);
-  assert.match(text(result), /live fetch is still running/);
+  assert.match(text(result), /official court source is still being checked/);
   assert.match(text(result), /req_1/);
+  await close();
+  await api.close();
+});
+
+// From 12 Nov 2026 the API checks the official court source by default for a CNR it does not hold
+// (202 pending, uncharged), fetch=false opts out, and Supreme Court CNRs are fetched too.
+const SC_CNR = 'ZZAB010000012026';
+
+test('lookup_case_by_cnr by default sends no fetch parameter and explains the 202 pending court check', async () => {
+  const api = await startApi(() => ({ status: 202, body: { success: true, data: { cnr: SC_CNR, status: 'pending', requestId: 'req_2' } } }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: SC_CNR } });
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${SC_CNR}`);
+  assert.notEqual(result.isError, true);
+  assert.match(text(result), /official court source/);
+  assert.match(text(result), /call lookup_case_by_cnr again/i);
+  assert.match(text(result), /several minutes/);
+  await close();
+  await api.close();
+});
+
+test('lookup_case_by_cnr sends fetch=false when fetch is false, to opt out of the court check', async () => {
+  const api = await startApi(() => ({ status: 404, body: { success: false, error: 'No case found for this CNR', code: 'CASE_NOT_FOUND' } }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: SC_CNR, fetch: false } });
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${SC_CNR}?fetch=false`);
+  assert.equal(result.isError, true);
+  assert.match(text(result), /CASE_NOT_FOUND/);
+  await close();
+  await api.close();
+});
+
+test('lookup_case_by_cnr describes the official source default, the fetch false opt out and the daily cap', async () => {
+  const api = await startApi(() => ok({}));
+  const { client, close } = await connect(api.baseUrl);
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === 'lookup_case_by_cnr');
+  const all = tool.description + ' ' + tool.inputSchema.properties.fetch.description;
+  assert.match(all, /by default/i);
+  assert.match(all, /202/);
+  assert.match(all, /fetch false/);
+  assert.match(all, /Supreme Court/);
+  assert.match(all, /several minutes/);
+  assert.match(all, /LIVE_FETCH_LIMIT_REACHED/);
+  assert.match(all, /LIVE_FETCH_NOT_ALLOWED/);
+  assert.doesNotMatch(all, /always\s+404/);
+  assert.doesNotMatch(all, /cannot be fetched live/);
+  assert.doesNotMatch(all, /Set true only if a previous call said the CNR is not found/);
+  await close();
+  await api.close();
+});
+
+test('watchlist tool descriptions no longer say a Supreme Court CNR we do not hold is not found at once', async () => {
+  const api = await startApi(() => ok({}));
+  const { client, close } = await connect(api.baseUrl);
+  const { tools } = await client.listTools();
+  for (const name of ['create_watchlist', 'add_cases_to_watchlist']) {
+    const tool = tools.find((t) => t.name === name);
+    assert.doesNotMatch(tool.description, /Supreme Court CNR we do not hold\)/, `${name} drops the old not_found clause`);
+    assert.match(tool.description, /Supreme Court/, `${name} says Supreme Court CNRs are checked too`);
+  }
+  await close();
+  await api.close();
+});
+
+test('a LIVE_FETCH_LIMIT_REACHED 429 on a CNR lookup is not retried and says the daily court check cap is reached', async () => {
+  const api = await startApi(() => ({
+    status: 429,
+    body: { success: false, code: 'LIVE_FETCH_LIMIT_REACHED', message: 'Daily limit reached.', retryAfter: 3600 },
+  }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: SC_CNR } });
+  assert.equal(api.calls.length, 1);
+  assert.equal(result.isError, true);
+  assert.match(text(result), /LIVE_FETCH_LIMIT_REACHED/);
+  assert.match(text(result), /fetch false/);
+  await close();
+  await api.close();
+});
+
+test('a LIVE_FETCH_NOT_ALLOWED 403 on a CNR lookup with fetch true tells the model to drop fetch', async () => {
+  const api = await startApi(() => ({
+    status: 403,
+    body: { success: false, error: 'Live fetch is not available on this plan.', code: 'LIVE_FETCH_NOT_ALLOWED' },
+  }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: SC_CNR, fetch: true } });
+  assert.equal(result.isError, true);
+  assert.match(text(result), /LIVE_FETCH_NOT_ALLOWED/);
+  assert.match(text(result), /lookup_case_by_cnr/);
   await close();
   await api.close();
 });

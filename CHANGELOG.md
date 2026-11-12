@@ -2,6 +2,22 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## Unreleased
+
+### Changed
+
+- `lookup_case_by_cnr` follows the server change of 12 Nov 2026: a CNR we do not hold is checked at the
+  official court source by default (eCourts for High Court and District Court CNRs, the Supreme Court
+  website for Supreme Court CNRs). The first call returns `pending` (202) and is free; polling returns the
+  record (1 credit) or a 404 when the court has no such case. A Supreme Court check can take several minutes.
+- `lookup_case_by_cnr` now sends `fetch=false` when `fetch: false` is passed, so the model can opt out of
+  the court check and get a plain 404 on a miss. Leaving `fetch` out uses the server default.
+  `fetch: true` behaves as before (403 `LIVE_FETCH_NOT_ALLOWED` on a plan without live fetch).
+- `create_watchlist` and `add_cases_to_watchlist` no longer say a Supreme Court CNR we do not hold is
+  `not_found` at once: it is checked at the official source and comes back `pending`.
+- Error guidance for 429 `LIVE_FETCH_LIMIT_REACHED` (the per account daily cap on new CNR court checks)
+  and for 403 `LIVE_FETCH_NOT_ALLOWED` now names `fetch` on `lookup_case_by_cnr` as well as `refresh`.
+
 ## 0.5.0
 
 ### Added

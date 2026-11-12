@@ -1228,15 +1228,21 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "citations or keywords. COSTS 1 CREDIT, charged only when a case record is actually returned; not found and " +
         "pending cost nothing. The result's data.status is one of: found (data.case is the full case record, " +
         "same shape as get_case, including caseStatus, caseStage, nextHearingDate, lastListedOn and orderCount); " +
-        "pending (a live fetch from the court is running: wait a few seconds and call this tool again with the same " +
-        "arguments; data.requestId is opaque and does not work with get_case_timeline); or, when the CNR is not in " +
-        "our records and fetch was not set, a 404 Not found error (a Supreme Court CNR we do not hold is always " +
-        "404, it cannot be fetched live). In that last case, ask the user before retrying with fetch true, " +
-        "because a live fetch is limited per day and the record, once it lands, costs 1 credit. If the court " +
-        "already had nothing for this CNR in the last 24 hours, fetch true does not ask it again: the call is a 404 " +
-        "straight away, so do not keep retrying; tell the user to check the CNR or try tomorrow. A case that was " +
-        "taken down at a party's request is not available and is reported as not found. Typical flow: call with fetch false; if " +
-        "not found and the user wants it, call again with fetch true; then repeat the call until status is found. " +
+        "pending (HTTP 202: the CNR is not in our records, so the official court source is being checked: eCourts " +
+        "for High Court and District Court CNRs, the Supreme Court website for Supreme Court CNRs; wait a few " +
+        "seconds and call this tool again with the same arguments, and keep polling, a Supreme Court check can take " +
+        "several minutes; data.requestId is opaque and does not work with get_case_timeline); or a 404 Not found " +
+        "error when the court says there is no such case. This official source check happens by default, so you do " +
+        "not need to set fetch. Pass fetch false only to skip it (for example when the user wants an instant answer " +
+        "from our records alone): a CNR we do not hold is then a 404 straight away and no court is contacted. On a " +
+        "plan without live fetch access the default simply answers 404 for a CNR we do not hold, while fetch true is " +
+        "refused with HTTP 403 LIVE_FETCH_NOT_ALLOWED. A per account daily cap applies to new CNR court checks: over " +
+        "it the call fails with HTTP 429 LIVE_FETCH_LIMIT_REACHED; do not retry today, offer to try tomorrow or call " +
+        "again with fetch false to read our records only. If the court already had nothing for this CNR in the last " +
+        "24 hours it is not asked again: the call is a 404 straight away, so do not keep retrying; tell the user to " +
+        "check the CNR or try tomorrow. A case that was taken down at a party's request is not available and is " +
+        "reported as not found. Typical flow: call with just the cnr; if status is pending, repeat the same call " +
+        "until it is found or a 404. " +
         "To be told when this case changes later, add it with add_cases_to_watchlist.",
       inputSchema: {
         cnr: cnrParam,
@@ -1244,11 +1250,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .boolean()
           .optional()
           .describe(
-            "Default false. Set true only if a previous call said the CNR is not found: starts a live fetch from " +
-              "the court's own system for a case we do not hold yet. The call that starts the fetch is free and returns " +
-              "pending; the later call that returns the record costs 1 credit, and a fetch the court cannot satisfy is free. It shares " +
-              "the per day live fetch cap with request_case_timeline refresh (HTTP 429 LIVE_FETCH_LIMIT_REACHED once " +
-              "exhausted). Returns status pending; call again shortly."
+            "Leave this out in normal use: a CNR we do not hold is then checked at the official court source by " +
+              "default (first call free, returns pending; the call that returns the record costs 1 credit; a check " +
+              "the court cannot satisfy is free). Set false to skip that check and read our records only: a CNR we do " +
+              "not hold is a 404 at once. Set true to ask for the court check explicitly, as before; on a plan " +
+              "without live fetch access true is refused with HTTP 403 LIVE_FETCH_NOT_ALLOWED. New CNR court checks " +
+              "count toward a per account daily cap (HTTP 429 LIVE_FETCH_LIMIT_REACHED once exhausted)."
           ),
       },
     },
@@ -1257,14 +1264,15 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       const result = await callApi(opts, {
         method: "GET",
         path: `cases/by-cnr/${encodeURIComponent(cnrForRequest(cnr))}`,
-        query: fetch ? { fetch: "true" } : undefined,
+        query: fetch === undefined ? undefined : { fetch: fetch ? "true" : "false" },
         timeoutMs: LOOKUP_TIMEOUT_MS,
       });
       if (!result.ok) return errorResult(result.message);
       const status = result.data?.data?.status;
       const note =
         status === "pending"
-          ? "The live fetch is still running. Call lookup_case_by_cnr again with the same arguments in a few seconds."
+          ? "The official court source is still being checked. Call lookup_case_by_cnr again with the same arguments " +
+            "in a few seconds; a Supreme Court check can take several minutes, so keep polling."
           : undefined;
       return envelopeResult(result.data, note);
     }
@@ -1283,12 +1291,13 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Enterprise by contract), a daily allowance on how many cases can be added (Free 50, Pay As You Go 5,000, " +
         "Scale 50,000, Enterprise 500,000, resetting at midnight IST) and at most 50 watchlists, so reuse an existing watchlist (list_watchlists) rather " +
         "than creating a new one for every case. Each CNR in items gets a result: watching (already in our records), " +
-        "pending (not in our records yet, so a live fetch was started and it will become watching), invalid (not a " +
+        "pending (not in our records yet, so the official court source is being checked, Supreme Court CNRs " +
+        "included, and it will become watching; a Supreme Court check can take several minutes), invalid (not a " +
         "valid CNR), duplicate (already on this list), cap_exceeded (over the account cap, over the daily add " +
         "allowance, or over the daily limit on adding cases we do not hold yet: Free 20, Pay As You Go 500, Scale " +
         "5,000; the item message says which) or not_found (the court has no such case, the court had nothing for " +
-        "it in the last 24 hours so it is not asked again until tomorrow, the case was taken down at a party's " +
-        "request, or a Supreme Court CNR we do not hold). Cases that end up not_found still count toward the cap " +
+        "it in the last 24 hours so it is not asked again until tomorrow, or the case was taken down at a party's " +
+        "request). Cases that end up not_found still count toward the cap " +
         "until removed. A partial success is still a success: read the per item results. Each case produces one " +
         "case.tracking_started event with its current state once its first fresh check completes (straight away if " +
         "our record is already current), not a flood of historical events, so it can arrive a little after the add. " +
@@ -1342,13 +1351,14 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       description:
         "Starts watching 1 to 100 cases (by CNR) on an existing watchlist. FREE, no credits; daily checks are " +
         "included, subject to the account's watched case cap. Each CNR gets a result: watching (already in our " +
-        "records), pending (not in our records yet, so a live fetch was started; it becomes watching when the case " +
+        "records), pending (not in our records yet, so the official court source is being checked, Supreme Court " +
+        "CNRs included, and a Supreme Court check can take several minutes; it becomes watching when the case " +
         "lands), invalid (not a valid CNR), duplicate (already on this list), cap_exceeded (the account is at its " +
         "watched case cap, its daily add allowance (Free 50, Pay As You Go 5,000, Scale 50,000, Enterprise 500,000) " +
         "or its daily limit on adding cases we do not hold yet, so remove cases you no longer need " +
         "with remove_case_from_watchlist, or retry tomorrow; the item message says which) or not_found (the court " +
         "has no such case, the court had nothing for it in the last 24 hours so it is not asked again until " +
-        "tomorrow, the case was taken down at a party's request, or a Supreme Court CNR we do not hold). A case " +
+        "tomorrow, or the case was taken down at a party's request). A case " +
         "that is not_found still counts toward the cap until removed. If the cap " +
         "is already full and you send a new CNR the call fails with 403 WATCH_CAP_EXCEEDED. A partial success is still a success: always read the per item results and " +
         "tell the user about any that were not watching or pending. Each watched case produces a " +
