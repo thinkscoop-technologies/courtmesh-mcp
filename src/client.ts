@@ -122,8 +122,15 @@ function codeGuidance(code: string | undefined): string | undefined {
       );
     case "LIVE_FETCH_NOT_ALLOWED":
       return (
-        "This call needs a live fetch (refresh: true), which is not available on this tier. Drop refresh " +
-        "to accept a stored-only result, or upgrade the plan for live fetch access."
+        "This call asked for a live fetch (refresh true on request_case_timeline, fetch true on " +
+        "lookup_case_by_cnr), which is not available on this tier. Drop refresh or fetch to accept a stored-only " +
+        "result, or upgrade the plan for live fetch access."
+      );
+    case "LIVE_FETCH_LIMIT_REACHED":
+      return (
+        "Code: LIVE_FETCH_LIMIT_REACHED. This account's daily cap on live court fetches (request_case_timeline " +
+        "refresh, new CNR court checks in lookup_case_by_cnr) is used up. Do not retry today. For a CNR, call " +
+        "lookup_case_by_cnr with fetch false to read stored records only, or try again after the reset."
       );
     case "SEMANTIC_NOT_ALLOWED":
       return "Semantic search is not available on this tier. Use search_indian_court_cases instead, or upgrade the plan.";
@@ -272,8 +279,8 @@ function describeNotFoundError(body: any): string {
   // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.
   if (body?.code === "CASE_NOT_FOUND" && body?.status === "not_found" && typeof body?.cnr === "string") {
     parts.push(
-      "If a live fetch was already tried and the court had nothing, the court is not " +
-        "asked again for 24 hours, so retrying with fetch true will not help until tomorrow. Check the CNR with the user."
+      "If the court was already checked and had nothing, it is not asked again for 24 hours, " +
+        "so retrying will not help until tomorrow. Check the CNR with the user."
     );
   }
   return parts.join(" ");
