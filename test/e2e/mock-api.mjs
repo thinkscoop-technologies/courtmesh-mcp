@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * Mock CourtMesh public API server, driven by the real OpenAPI spec and its examples
- * (see dump-openapi.mjs / openapi.json, sourced from
- * ../../../research/server/public-api/openapi.ts).
+ * (dump-openapi.mjs writes a local, untracked openapi.json to compare against).
  *
  * Serves /api/v1/prod/* on a random loopback port with realistic response shapes for
  * all 18 documented endpoints, plus scripted error modes.
@@ -58,8 +57,8 @@ export const KEYS = {
   scenarioTimeout: makeKey("scenariotimeoutslow"),
   scenarioMalformed: makeKey("scenariomalformedjson"),
   scenario400TierCap: makeKey("scenario400tiercap"),
-  // Added for the api-v1-validations.ts / api-tiers.ts contract refresh: cursor,
-  // refresh, allowRemoteFetch and the abuse-control-pass refusal codes.
+  // Added for the API contract refresh: cursor,
+  // refresh, allowRemoteFetch and the newer refusal codes.
   scenarioCursorInvalid: makeKey("scenariocursorinvalid"),
   scenarioRemoteFetchNotAllowed: makeKey("scenarioremotefetchna"),
   scenarioLiveFetchNotAllowed: makeKey("scenariolivefetchna"),
@@ -146,7 +145,7 @@ export const CASE_NO_DOCS = {
   respondents: ["Municipal Corporation"],
   decisionDate: "2024-02-20",
   disposalNature: "Pending",
-  summary: "Writ petition concerning a municipal demolition notice, status-only record with no document indexed yet.",
+  summary: "Writ petition concerning a municipal demolition notice, registry record with no stored document yet.",
   hasDocuments: false,
   documentCount: 0,
   hasAnalysis: false,
@@ -260,7 +259,7 @@ function redactedHeaders(req) {
 
 // ---------------------------------------------------------------------------
 // Response builders (match the real API's response envelopes and field names
-// exactly, per the OpenAPI spec extracted into test/e2e/openapi.json)
+// exactly, per the OpenAPI spec)
 // ---------------------------------------------------------------------------
 
 function unauthorized(res) {
@@ -300,7 +299,7 @@ function scenario403EnterpriseBody() {
   return {
     success: false,
     code: "API_ENTERPRISE_ONLY",
-    message: "The public API is available to Enterprise accounts only while self serve tiers are off.",
+    message: "This API key is not entitled to the public API.",
     tier: "payg",
     upgradeUrl: "https://research.courtmesh.ai/api/settings/api-keys#credits",
   };
@@ -347,8 +346,7 @@ function scenario400TierCapBody() {
 }
 
 function scenario503Body() {
-  // Matches the real API's shape exactly (confirmed via raw REST in
-  // QA_LIVE_MCP_AUTH_2026-09-19.md, finding 4): "code" is present alongside "error"/"message" on
+  // Matches the real API's shape exactly: "code" is present alongside "error"/"message" on
   // this 5xx, and describeGenericError in src/client.ts must surface it like the 400/403/404
   // describers already do.
   return {
@@ -371,7 +369,7 @@ function scenarioRemoteFetchNotAllowedBody() {
   return {
     success: false,
     code: "REMOTE_FETCH_NOT_ALLOWED",
-    message: "This case has no document stored in S3; fetching it from an external URL requires allowRemoteFetch: true in the request body.",
+    message: "This case has no stored document; fetching it from an external URL requires allowRemoteFetch: true in the request body.",
     tier: "payg",
     upgradeUrl: "https://research.courtmesh.ai/api/settings/api-keys#credits",
   };
@@ -413,7 +411,7 @@ function scenarioTooManyKeysBody() {
     success: false,
     error: "Rate limit exceeded",
     code: "TOO_MANY_KEYS_FROM_IP",
-    message: "Too many different API keys used from this address today. This limit is 5 per day.",
+    message: "Too many different API keys used from this address today.",
     retryAfter: 30_000,
     resetTime: new Date(Date.now() + 30_000_000).toISOString(),
   };
@@ -596,33 +594,28 @@ function route(pathname, method, url, body, res, ctx) {
       success: true,
       data: {
         generatedAt,
-        index: "courtmesh_cases",
-        total: 310_452_118,
-        documentBearing: 2_104_552,
-        statusOnly: 308_347_566,
+        index: "corpus-0123456789ab",
+        total: 1_000,
         byCourtType: [
-          { courtType: "Supreme Court", records: 412_003, documentBearing: 398_221, latestDecisionDate: "2026-09-15" },
-          { courtType: "High Court", records: 18_204_991, documentBearing: 1_204_887, latestDecisionDate: "2026-09-17" },
-          { courtType: "District Court", records: 291_835_124, documentBearing: 501_444, latestDecisionDate: "2026-09-17" },
+          { courtType: "Supreme Court", records: 100, latestDecisionDate: "2026-09-15" },
+          { courtType: "High Court", records: 400, latestDecisionDate: "2026-09-17" },
+          { courtType: "District Court", records: 500, latestDecisionDate: "2026-09-17" },
         ],
         byYear: [
-          { year: 2024, records: 12_004_221 },
-          { year: 2025, records: 11_887_310 },
-          { year: 2026, records: 8_221_004 },
+          { year: 2024, records: 90 },
+          { year: 2025, records: 110 },
+          { year: 2026, records: 120 },
         ],
         courts: [
-          { court: "Delhi High Court", records: 1_204_887, documentBearing: 302_112, earliestDecisionDate: "1950-01-05", latestDecisionDate: "2026-09-17", businessDaysBehind: 1 },
-          { court: "Bombay High Court", records: 1_004_221, documentBearing: 288_004, earliestDecisionDate: "1948-03-12", latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
+          { court: "Delhi High Court", records: 200, earliestDecisionDate: "1950-01-05", latestDecisionDate: "2026-09-17", businessDaysBehind: 1 },
+          { court: "Bombay High Court", records: 150, earliestDecisionDate: "1948-03-12", latestDecisionDate: "2026-09-16", businessDaysBehind: 2 },
         ],
-        districtCourts: { records: 291_835_124, documentBearing: 501_444, latestDecisionDate: "2026-09-17", businessDaysBehind: 1 },
+        districtCourts: { records: 500, latestDecisionDate: "2026-09-17", businessDaysBehind: 1 },
       },
       meta: {
         generatedAt,
         cacheTtlSeconds: 21_600,
-        corpusNote:
-          "A record is any case CourtMesh has indexed from a court registry (parties, dates, status, docket). " +
-          '"documentBearing" counts records that also have the order or judgment text indexed; the rest are ' +
-          '"statusOnly", registry metadata with no document text yet. total = documentBearing + statusOnly.',
+        corpusNote: "Counted on the generatedAt date.",
       },
     });
     return;
@@ -656,8 +649,8 @@ function route(pathname, method, url, body, res, ctx) {
       });
       return;
     }
-    // Deliberately mongoId, not id: the real /search/cases OpenSearch index does not return an
-    // "id" field at all (QA_LIVE_MCP_AUTH_2026-09-19.md, finding 2), only mongoId, unlike
+    // Deliberately mongoId, not id: the real /search/cases response does not return an
+    // "id" field at all, only mongoId, unlike
     // semantic_search_cases below which does return a real id. This is what
     // backfillSearchHitIds in src/tools.ts must fill in for the tool result to actually satisfy
     // its own documented "id field from search results" instruction.
@@ -787,7 +780,7 @@ function route(pathname, method, url, body, res, ctx) {
     }
 
     if (sub === "pdf" && method === "GET") {
-      // Two distinct 404s, matching api-v1-prod.ts: CASE_NOT_FOUND (no such case at all) versus
+      // Two distinct 404s, matching the API: CASE_NOT_FOUND (no such case at all) versus
       // PDF_NOT_STORED (the case exists but has no stored document), the latter with a hint.
       if (!record) { json(res, 404, { success: false, error: "Case not found", code: "CASE_NOT_FOUND" }); return; }
       if (!record.hasDocuments) {
@@ -1071,6 +1064,88 @@ function route(pathname, method, url, body, res, ctx) {
         { code: "CRL.A.", fullForm: "Criminal Appeal", primaryType: "Criminal", nature: "Appellate" },
         { code: "WP(C)", fullForm: "Writ Petition (Civil)", primaryType: "Civil", nature: "Original" },
       ],
+    });
+    return;
+  }
+
+  // POST /party/profile (quick answers 200 with a profile, full answers 202 with a requestId)
+  if (pathname === "/party/profile" && method === "POST") {
+    if (!body || typeof body.name !== "string" || !body.entityType || !body.purpose) {
+      json(res, 400, { success: false, code: "VALIDATION_ERROR", error: "Validation failed.", details: ["purpose: Required."] });
+      return;
+    }
+    if (body.mode === "full") {
+      const requestId = "ppr_" + "0123456789abcdef".repeat(2);
+      json(res, 202, {
+        success: true,
+        data: { requestId, mode: "full", status: "queued", statusUrl: `/api/v1/prod/party/profile/${requestId}`, maxCredits: body.maxCredits ?? 1000 },
+        meta: { creditsCharged: 0, metered: true },
+      });
+      return;
+    }
+    json(res, 200, {
+      success: true,
+      data: {
+        subject: { name: body.name, entityType: body.entityType },
+        verdict: "identity_found",
+        summary: "One identity at probable confidence with 1 case.",
+        identities: [
+          {
+            confidence: "probable",
+            why: ["The person you named is recorded as a relation in 1 case of this group."],
+            caseCount: 1,
+            cases: [
+              {
+                caseId: CASE_PENDING.id,
+                cnr: "ZZAB010000012024",
+                court: "Example Tribunal",
+                courtType: "Tribunal",
+                bench: "Example Bench",
+                title: CASE_PENDING.title,
+                partyRole: "respondent",
+                status: "pending",
+                decisionDate: null,
+                courtRecordActs: [{ act: "EXAMPLE ACT", sections: ["1"] }],
+                confidence: "probable",
+                matchReasons: ["a known relative's name matches a relation recorded in the case"],
+                documents: [],
+              },
+            ],
+          },
+        ],
+        possibleOtherPeople: [],
+        relatedButUnverified: [],
+        notes: [],
+        notice: "A party can ask for a case to be withheld from search.",
+      },
+      meta: { creditsCharged: 100, metered: true, creditsBreakdown: { searches: { count: 4, credits: 4 }, minimumCharge: { credits: 96 } }, adjudicated: false, corpusAsOf: new Date().toISOString() },
+    });
+    return;
+  }
+
+  // GET /party/profile/{requestId}
+  const profileMatch = pathname.match(/^\/party\/profile\/([^/]+)$/);
+  if (profileMatch && method === "GET") {
+    const requestId = decodeURIComponent(profileMatch[1]);
+    if (requestId !== "ppr_" + "0123456789abcdef".repeat(2)) {
+      json(res, 404, { success: false, code: "NOT_FOUND", error: "No party profile request with this id." });
+      return;
+    }
+    json(res, 200, {
+      success: true,
+      data: {
+        requestId,
+        mode: "full",
+        status: "running",
+        stage: "analyse",
+        progress: { casesFound: 1, refreshesStarted: 1, refreshesFinished: 1, casesAnalysed: 0, casesNotAnalysed: 0, partyAnalysis: "pending" },
+        createdAt: "2026-11-11T09:30:00.000Z",
+        startedAt: "2026-11-11T09:30:02.000Z",
+        finishedAt: null,
+        resultExpiresAt: null,
+        credits: { charged: 5, maxCredits: 1000, breakdown: { search: { credits: 4 }, courtRefreshes: { count: 1, credits: 1 }, caseAnalyses: { full: 0, short: 0, existing: 0, tokens: 0, credits: 0 }, partyAnalysis: { tokens: 0, credits: 0 } } },
+      },
+      meta: { creditsCharged: 0, metered: true },
     });
     return;
   }

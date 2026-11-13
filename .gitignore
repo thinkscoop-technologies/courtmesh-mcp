@@ -1,4 +1,5 @@
 node_modules/
+test/e2e/openapi.json
 dist/
 .env
 .env.*

@@ -30,12 +30,9 @@ export const LOOKUP_TIMEOUT_MS = envMs("COURTMESH_LOOKUP_TIMEOUT_MS", 30_000);
 /**
  * Longer timeout for semantic search and consolidated analysis, which can take minutes.
  * Overridable via COURTMESH_LONG_TIMEOUT_MS, same rationale as COURTMESH_DEFAULT_TIMEOUT_MS.
- * Deliberately 630s, not a round 600s: the server side semantic search handler
- * itself runs a 10 minute req.setTimeout, but analyze-consolidated and other
- * long calls are typically bounded well under 10 minutes, and a client timeout
- * exactly equal to a server timeout is a race either side can win. 630s gives
- * the server's own bounded work (up to ~600s in the slowest documented case)
- * a margin to time out and answer first.
+ * Deliberately 630s, not a round 600s: a client timeout exactly equal to a
+ * server timeout is a race either side can win, so this leaves the server a
+ * margin to time out and answer first.
  */
 export const LONG_TIMEOUT_MS = envMs("COURTMESH_LONG_TIMEOUT_MS", 630_000);
 
@@ -79,6 +76,8 @@ export interface RequestOptions {
    * charges or double runs a job.
    */
   idempotencyKey?: string;
+  /** Aborts the call when the MCP client cancels the tool request. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -141,8 +140,43 @@ function codeGuidance(code: string | undefined): string | undefined {
       return "Call list_watchlist_cases to see what is on it.";
     case "WATCH_CAP_EXCEEDED":
       return "This account is at its watched case cap. Remove cases you no longer need with remove_case_from_watchlist, or upgrade the plan.";
+    case "SETTLEMENT_UNCONFIRMED":
+      return "The charge outcome for this call is unknown and no results were returned. Do not retry yet: check the balance with get_api_usage first. Repeating the same call is refused with 409 IDEMPOTENCY_IN_PROGRESS for up to 24 hours; tell the user.";
+    case "CAUSE_LISTS_NOT_ENABLED":
+      return "Cause lists are not enabled on this account, so repeating the call will not help. Tell the user.";
+    case "MATTER_NOT_FOUND":
+      return "Use a matterId from a listing returned by list_cause_listings, or check the id with the user. Nothing was charged.";
+    case "COURT_LIST_NOT_FOUND":
+      return "Court lists can only be read for a court where this account has an open matter. Use a courtKey from a listing returned by list_cause_listings. Nothing was charged.";
     case "WATCHLIST_LIMIT_REACHED":
       return "This account has reached its watchlist limit. Reuse an existing watchlist (list_watchlists) instead of creating a new one.";
+    case "ACT_NOT_FOUND":
+      return "No published act has this slug. Do not guess slugs: call resolve_act with a short form or name, or search_acts, and use the slug it returns. Nothing was charged.";
+    case "SECTION_NOT_FOUND":
+      return "No published provision has this act and section slug. Call lookup_section with a citation such as section 302 IPC, or list_act_sections for the act, and use the slugs they return. Nothing was charged.";
+    case "UPSTREAM_UNAVAILABLE":
+      return "This is temporary and nothing was charged. It is safe to retry the same call once after a short wait. If it fails again, tell the user and stop.";
+    case "UPSTREAM_TIMEOUT":
+      return "The search took too long. Try more specific words. Nothing was charged.";
+    case "PARTY_PROFILE_FULL_UNAVAILABLE":
+      return "Full mode is not available right now and nothing was charged. Call build_party_profile again with mode quick.";
+    case "PARTY_PROFILE_TOO_MANY_ACTIVE":
+      return "This account already has 3 full profiles queued or running, and nothing was charged. Wait for one to finish (read it with get_party_profile) before starting another; repeating now is refused the same way.";
+    case "DISTINCT_NAMES_LIMIT_REACHED":
+      return "The daily limit on distinct names has been reached and nothing was charged. Wait for the retry time; trying other spellings of the name will be refused too.";
+    case "PARTY_SCREEN_SEARCH_DEGRADED":
+      return "The search behind this check failed and nothing was charged. It is safe to retry the same call once after a short wait. If it fails again, tell the user and stop.";
+    case "ACCOUNT_STANDING_UNAVAILABLE":
+    case "ENTITLEMENT_UNAVAILABLE":
+      return "The account standing or credit entitlement could not be confirmed, so nothing ran and nothing was charged. It is safe to retry the same call once after a short wait.";
+    case "API_NOT_AVAILABLE_ON_TRIAL":
+      return "This account is still on trial and this call is not open to it yet, so repeating it will not help. Tell the user.";
+    case "API_ENTERPRISE_ONLY":
+      return "This API key is not entitled to this call, so repeating it will not help. Tell the user.";
+    case "IDEMPOTENCY_IN_PROGRESS":
+      return "An identical call from this session is still running. Do not repeat it: wait, then check the outcome (for a charged call, check get_api_usage). It is not charged twice.";
+    case "IDEMPOTENCY_KEY_REUSED":
+      return "The same request key was used before with different arguments. Call again with fresh true to send it as a new request; nothing was charged for this attempt.";
     default:
       return undefined;
   }
@@ -240,6 +274,9 @@ function describeRateLimitError(body: any): string {
   const resetTime = body?.resetTime;
   const message: string | undefined = typeof body?.message === "string" ? body.message : undefined;
   const parts: string[] = ["Rate limited (429)."];
+  // The code tells apart a per minute limit, a daily allowance and a limit on concurrent work (for
+  // example PARTY_PROFILE_TOO_MANY_ACTIVE); it used to be dropped here, unlike the 403 and 404 paths.
+  if (typeof body?.code === "string") parts.push(`Code: ${body.code}.`);
   if (retryAfter !== undefined) {
     parts.push(`Retry after ${retryAfter} seconds.`);
   }
@@ -266,7 +303,15 @@ function describeNotFoundError(body: any): string {
   if (typeof body?.hint === "string") {
     parts.push(body.hint);
   }
-  const guidance = body?.code === "WATCHLIST_NOT_FOUND" || body?.code === "ITEM_NOT_FOUND" ? codeGuidance(body.code) : undefined;
+  const guidance =
+    body?.code === "WATCHLIST_NOT_FOUND" ||
+    body?.code === "ITEM_NOT_FOUND" ||
+    body?.code === "ACT_NOT_FOUND" ||
+    body?.code === "SECTION_NOT_FOUND" ||
+    body?.code === "MATTER_NOT_FOUND" ||
+    body?.code === "COURT_LIST_NOT_FOUND"
+      ? codeGuidance(body.code)
+      : undefined;
   if (guidance) parts.push(guidance);
   // A CNR lookup that found nothing (the body carries the cnr and status "not_found"). After a
   // live fetch finds nothing the court is not asked again for 24 hours, so retrying fetch is futile.
@@ -350,8 +395,26 @@ interface RawAttempt {
  * not be silently replayed by this client), and no other status or code is
  * ever retried.
  */
+/** Sleeps for `ms`, but rejects at once when `signal` aborts, so a cancelled call does not sit out a 429 back-off. */
+function abortableSleep(ms: number, signal: AbortSignal | undefined, method: string, path: string): Promise<void> {
+  const cancelled = () =>
+    new CourtMeshApiError(`The request to the CourtMesh API was cancelled (${method} ${path}) while waiting to retry.`);
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(cancelled());
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancelled());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function request<T = any>(options: ClientOptions & RequestOptions): Promise<T> {
-  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs, idempotencyKey } = options;
+  const { baseUrl, apiKey, apiKeyOverride, method = "GET", path, query, body, timeoutMs, idempotencyKey, signal } = options;
   const effectiveKey = apiKeyOverride ?? apiKey;
   const url = buildUrl(baseUrl, path, query);
   const timeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -372,8 +435,12 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
+    const onCancel = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", onCancel, { once: true });
 
     let response: Response;
+    let text: string;
     try {
       response = await fetch(url, {
         method,
@@ -381,8 +448,16 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
+      // The timer and the cancellation listener stay alive through the body read: a server that sends
+      // headers and then stalls must still hit the deadline, and a cancel must stop the read.
+      text = await response.text();
     } catch (err: any) {
       clearTimeout(timer);
+      if (signal?.aborted) {
+        throw new CourtMeshApiError(
+          `The request to the CourtMesh API was cancelled (${method} ${path}). If it was a charged call, check usage before repeating it.`
+        );
+      }
       if (err?.name === "AbortError") {
         throw new CourtMeshApiError(
           `Request to CourtMesh API timed out after ${Math.round(timeout / 1000)} seconds (${method} ${path}). ` +
@@ -395,9 +470,9 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
       );
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onCancel);
     }
 
-    const text = await response.text();
     let parsed: any = undefined;
     let jsonParseFailed = false;
     if (text.length > 0) {
@@ -439,7 +514,7 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
           ? bodySeconds
           : 1;
     const delayMs = Math.min(retryAfterSeconds * 1000, MAX_RETRY_DELAY_MS);
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await abortableSleep(delayMs, signal, method, path);
     result = await attempt();
   }
 
@@ -447,7 +522,7 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
 
   const errorMessage = classifyError(status, parsed);
   if (errorMessage) {
-    // Every response carries X-Request-Id (server/middleware/api-request-id.ts); an error
+    // Every response carries X-Request-Id; an error
     // body that already echoes it in its own "requestId" field wins (older server builds
     // that pre-date the header can still carry a body-level requestId on some codes), the
     // response header is the fallback so a caller reporting a problem to CourtMesh support

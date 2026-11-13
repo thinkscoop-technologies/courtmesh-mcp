@@ -17,7 +17,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { registerCourtMeshTools } from '../dist/tools.js';
 import { normalizeCnr, cnrForRequest } from '../dist/cnr.js';
 
-const CNR = 'DLHC010084212021';
+const CNR = 'ZZAB010000012024';
 const NEW_TOOLS = [
   'lookup_case_by_cnr',
   'create_watchlist',
@@ -68,7 +68,7 @@ test('the seven monitoring tools are listed with substantive descriptions', asyn
   const api = await startApi(() => ok({}));
   const { client, close } = await connect(api.baseUrl);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 25);
+  assert.equal(tools.length, 45);
   for (const name of NEW_TOOLS) {
     const tool = tools.find((t) => t.name === name);
     assert.ok(tool, `${name} is registered`);
@@ -81,16 +81,73 @@ test('the seven monitoring tools are listed with substantive descriptions', asyn
 });
 
 test('normalizeCnr handles common spellings', () => {
-  assert.equal(normalizeCnr('CNR: DLHC-01-008421-2021'), CNR);
-  assert.equal(normalizeCnr('cnr no dlhc010084212021'), CNR);
+  assert.equal(normalizeCnr('CNR: ZZAB-01-000001-2024'), CNR);
+  assert.equal(normalizeCnr('cnr no zzab010000012024'), CNR);
   assert.equal(normalizeCnr('nope'), null);
   assert.equal(cnrForRequest('  nope '), 'nope');
+});
+
+test('get_case and lookup_case_by_cnr pass include; without it nothing is sent', async () => {
+  const api = await startApi(() => ok({ id: 'c1', cnr: CNR, status: 'found' }));
+  const { client, close } = await connect(api.baseUrl);
+  await client.callTool({ name: 'get_case', arguments: { id: 'c1' } });
+  await client.callTool({ name: 'get_case', arguments: { id: 'c1', include: ['hearings', 'advocates'] } });
+  await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: CNR, include: ['hearings'] } });
+  assert.equal(api.calls[0].url, '/api/v1/prod/cases/c1');
+  assert.equal(decodeURIComponent(api.calls[1].url), '/api/v1/prod/cases/c1?include=hearings,advocates');
+  assert.equal(api.calls[2].url, `/api/v1/prod/cases/by-cnr/${CNR}?include=hearings`);
+  await close();
+  await api.close();
+});
+
+test('get_order_text: a bad id fails before any call; long text comes in parts, marked as third party', async () => {
+  const body = 'x'.repeat(45_000);
+  const api = await startApi(() => ok({ caseId: 'c1', documentId: 'a'.repeat(24), textAvailable: true, text: body, textLength: body.length }));
+  const { client, close } = await connect(api.baseUrl);
+  const bad = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: '{"$ne":null}' } });
+  assert.ok(bad.isError);
+  assert.equal(api.calls.length, 0);
+  const first = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24) } });
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/c1/orders/${'a'.repeat(24)}/text`);
+  assert.equal(first._meta.provenance.untrusted_content, true);
+  assert.match(text(first), /"next_offset": 30000/);
+  assert.match(text(first), /offset 30000/);
+  const second = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24), offset: 30000 } });
+  assert.match(text(second), /"next_offset": null/);
+  await close();
+  await api.close();
+});
+
+test('get_order_text: no stored text passes the flags through and is not marked as content', async () => {
+  const api = await startApi(() => ok({ caseId: 'c1', documentId: 'a'.repeat(24), textAvailable: false, text: null, textLength: 0 }));
+  const { client, close } = await connect(api.baseUrl);
+  const result = await client.callTool({ name: 'get_order_text', arguments: { id: 'c1', document_id: 'a'.repeat(24) } });
+  assert.ok(!result.isError);
+  assert.match(text(result), /"textAvailable": false/);
+  assert.equal(result._meta.provenance.untrusted_content, false);
+  await close();
+  await api.close();
+});
+
+test('refresh tools send the canonical CNR, and the batch normalises every entry', async () => {
+  const api = await startApi(() => ({ status: 202, body: { success: true, data: { cnr: CNR, status: 'queued', results: [] } } }));
+  const { client, close } = await connect(api.baseUrl);
+  await client.callTool({ name: 'refresh_case_by_cnr', arguments: { cnr: 'cnr: zzab-01-000001-2024' } });
+  assert.equal(api.calls[0].method, 'POST');
+  assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${CNR}/refresh`);
+  await client.callTool({ name: 'get_case_refresh_state', arguments: { cnr: CNR } });
+  assert.equal(api.calls[1].method, 'GET');
+  await client.callTool({ name: 'refresh_cases_batch', arguments: { cnrs: ['zzab-01-000001-2024'] } });
+  assert.equal(api.calls[2].url, '/api/v1/prod/cases/refresh/batch');
+  assert.deepEqual(api.calls[2].body, { cnrs: [CNR] });
+  await close();
+  await api.close();
 });
 
 test('lookup_case_by_cnr normalises the CNR and returns found', async () => {
   const api = await startApi(() => ok({ cnr: CNR, status: 'found', case: { id: 'c1' }, requestId: null }));
   const { client, close } = await connect(api.baseUrl);
-  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: 'cnr: dlhc-01-008421-2021' } });
+  const result = await client.callTool({ name: 'lookup_case_by_cnr', arguments: { cnr: 'cnr: zzab-01-000001-2024' } });
   assert.equal(api.calls[0].method, 'GET');
   assert.equal(api.calls[0].url, `/api/v1/prod/cases/by-cnr/${CNR}`);
   assert.equal(api.calls[0].headers['x-api-key'].startsWith('cm-'), true);
@@ -139,7 +196,7 @@ test('create_watchlist posts normalised items and sends no Idempotency-Key', asy
   const { client, close } = await connect(api.baseUrl);
   const result = await client.callTool({
     name: 'create_watchlist',
-    arguments: { name: 'Loans', items: [{ cnr: 'dlhc 01 008421 2021', reference: 'LOAN-42' }] },
+    arguments: { name: 'Loans', items: [{ cnr: 'zzab 01 000001 2024', reference: 'LOAN-42' }] },
   });
   assert.equal(api.calls[0].method, 'POST');
   assert.equal(api.calls[0].url, '/api/v1/prod/watchlists');
@@ -310,11 +367,11 @@ test('list_watchlist_cases accepts the unavailable status and shows null case fi
 test('add_cases_to_watchlist returns cap_exceeded and cooldown not_found results as data', async () => {
   const results = [
     { cnr: CNR, result: 'cap_exceeded', message: 'The daily limit for adding case numbers has been reached. It resets at midnight IST.' },
-    { cnr: 'DLHC010084212022', result: 'not_found', message: 'eCourts had no such case when we last looked. Try again tomorrow.' },
+    { cnr: 'ZZAB010000022024', result: 'not_found', message: 'eCourts had no such case when we last looked. Try again tomorrow.' },
   ];
   const api = await startApi(() => ok({ results, itemCount: 3 }));
   const { client, close } = await connect(api.baseUrl);
-  const res = await client.callTool({ name: 'add_cases_to_watchlist', arguments: { watchlist_id: 'wl_1', items: [{ cnr: CNR }, { cnr: 'DLHC010084212022' }] } });
+  const res = await client.callTool({ name: 'add_cases_to_watchlist', arguments: { watchlist_id: 'wl_1', items: [{ cnr: CNR }, { cnr: 'ZZAB010000022024' }] } });
   assert.notEqual(res.isError, true);
   assert.match(text(res), /cap_exceeded/);
   assert.match(text(res), /Try again tomorrow/);

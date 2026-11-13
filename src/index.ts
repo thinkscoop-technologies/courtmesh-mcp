@@ -26,7 +26,7 @@ import { apiKeyOverrideStorage } from "./context.js";
 import { DEFAULT_BASE_URL, isValidApiKeyFormat } from "./client.js";
 
 const SERVER_NAME = "courtmesh-mcp";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 
 const baseUrl = process.env.COURTMESH_API_BASE_URL?.trim() || DEFAULT_BASE_URL;
 const apiKey = process.env.COURTMESH_API_KEY?.trim() || undefined;
@@ -80,8 +80,7 @@ function envInt(name: string, fallback: number): number {
 /**
  * Hard ceiling on live sessions, and therefore on the memory this process can
  * be made to hold. One session is a StreamableHTTPServerTransport plus its own
- * McpServer with every tool registered, measured at roughly 220 KB of RSS, so
- * the default cap is worth about 45 MB on a box that has 2 GB for eight apps.
+ * McpServer with every tool registered, so the cap bounds that memory.
  * When the cap is reached the least recently used session is closed, which is
  * the correct trade: an idle session is worth less than a live one.
  */
@@ -109,8 +108,8 @@ const INIT_MAX_TRACKED = envInt("MCP_INIT_MAX_TRACKED", 5_000);
 /**
  * The client address, used only for the initialize rate limit.
  *
- * nginx sets X-Forwarded-For to $proxy_add_x_forwarded_for, which appends the
- * peer it actually saw to whatever the client sent, so the RIGHTMOST entry is
+ * Behind a reverse proxy, the proxy appends the peer it actually saw to
+ * whatever the client sent in X-Forwarded-For, so the RIGHTMOST entry is
  * the only one the client could not choose. The leftmost entry, which is what
  * req.ip would give under `trust proxy`, is attacker controlled and would hand
  * out one fresh identity per request.
@@ -293,8 +292,8 @@ async function runHttp(): Promise<void> {
    *
    * The header is preferred because a key in a query string ends up in access
    * logs, proxy logs and browser history, and because it matches how the REST
-   * API itself authenticates (see authenticateApiKey, which takes either
-   * X-API-Key or Authorization: Bearer). The query parameter stays supported
+   * API itself authenticates (it takes either X-API-Key or
+   * Authorization: Bearer). The query parameter stays supported
    * because several MCP clients can only configure a URL, with no way to attach
    * a header.
    *
@@ -306,9 +305,8 @@ async function runHttp(): Promise<void> {
    * warnIfKeyLooksWrong on whatever the caller sent, which was harmless while
    * the warning only ever fired for a local operator's own misconfigured stdio
    * key. On a public HTTP endpoint it is a log line per request, chosen by a
-   * stranger, so a flood of malformed keys becomes a flood of disk writes on a
-   * box that has run out of disk before. The caller is told what is wrong in
-   * the 401 body instead, which is where it belongs.
+   * stranger, so a flood of malformed keys becomes a flood of disk writes. The
+   * caller is told what is wrong in the 401 body instead, which is where it belongs.
    */
   function tokenFromRequest(req: Request): string | undefined {
     const auth = req.headers.authorization;
@@ -332,11 +330,10 @@ async function runHttp(): Promise<void> {
      * AUTHENTICATION BEFORE ALLOCATION.
      *
      * Everything below this block is cheap; everything above the transport
-     * construction has to stay that way. A session costs roughly 220 KB of RSS
-     * and used to be created for any anonymous POST that looked like an
-     * initialize, with the entry removed only when the client sent an explicit
-     * DELETE. A few thousand unauthenticated POSTs were therefore enough to
-     * exhaust a 2 GB box that also runs seven other apps.
+     * construction has to stay that way. A session holds real memory and must
+     * never be created for an anonymous POST that merely looks like an
+     * initialize, or be released only on an explicit DELETE: that would let
+     * unauthenticated callers grow memory without bound.
      *
      * The format check is not a validity check: only the CourtMesh API can say
      * whether a key is real, and asking it here would put a network call in
@@ -465,11 +462,11 @@ async function runHttp(): Promise<void> {
    * Express's default handler renders an HTML page whose body is the stack
    * trace whenever NODE_ENV is not "production", and a malformed JSON body is
    * enough to reach it: express.json() throws a SyntaxError with status 400
-   * before any route runs. That page disclosed the deploy user, the absolute
-   * deploy path and the dependency tree to any anonymous caller.
+   * before any route runs. That page disclosed filesystem paths and the
+   * dependency tree to any anonymous caller.
    *
-   * Setting NODE_ENV=production in pm2 also suppresses it, and it should be
-   * set, but it is one environment variable away from coming back. This handler
+   * Setting NODE_ENV=production in the environment also suppresses it, and it
+   * should be set, but it is one environment variable away from coming back. This handler
    * is the thing that makes the disclosure structurally impossible: the body is
    * a fixed JSON-RPC error, the detail goes to stderr, and neither depends on
    * how the process happens to be launched.
