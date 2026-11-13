@@ -2,6 +2,50 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## 0.6.0
+
+### Added
+
+- Nine tools for the Acts and sections API: `search_acts`, `resolve_act`, `get_act`, `get_act_history`,
+  `list_act_sections`, `get_section`, `search_sections`, `lookup_section` and
+  `list_section_citing_cases`. They need an API key with the `legislation` scope and
+  each costs 1 credit when something is returned.
+- Act and section slugs are checked against `^[a-z0-9][a-z0-9-]*$` before any request is sent, so a
+  malformed id fails at once.
+- Error guidance for `ACT_NOT_FOUND`, `SECTION_NOT_FOUND`, `UPSTREAM_UNAVAILABLE` and `UPSTREAM_TIMEOUT`.
+- Results state when nothing was returned and nothing was charged. An empty citing judgments list is
+  returned with a note that it does not mean no judgment applied the provision. A citing page can be short
+  or empty while more pages remain; the result then says to follow the cursor.
+- Search, resolve, lookup and citing list tools mention their lower per minute limit (429 above it).
+- Five tools: `list_case_orders`, `get_order_text`, `refresh_case_by_cnr`, `get_case_refresh_state` and
+  `refresh_cases_batch`. `get_order_text` returns long documents in parts, and marks
+  the result as third party content.
+- `include` on `get_case` and `lookup_case_by_cnr`: hearing history and advocates, at no extra charge.
+- Four cause list tools: `list_cause_listings`, `list_matter_cause_listings`, `get_court_cause_list` and `check_cause_list_for_cnrs`. They need the `causelist` API key scope and an account with cause lists enabled.
+- `check_cause_list_for_cnrs` checks 1 to 100 watched CNRs against stored lists for at most 7 days: 1 credit per CNR with status `listed` or `no_entry_found`, free for `list_not_read`, `cannot_check` and `not_watched`. The description and results state that `no_entry_found` does not prove a case is not listed. It sends an `Idempotency-Key` that includes a 5 minute time bucket and the default dates resolved in India time, so a retry inside the bucket replays and a later call reads the lists again; a replayed result states the dates it covers and that it may be out of date, and `fresh` reads again. The result gives `from` and `to`, the `reason` values and the District Court `list_not_read` note are documented, an invalid CNR and a check over 100 CNRs or over 300 CNRs times dates are rejected before any request, and the late 402 and the 503 `SETTLEMENT_UNCONFIRMED` (charge outcome unknown, do not retry, check the balance) are documented; the pair limit counts distinct CNRs.
+- Matter ids, court keys, dates and CNR counts are validated before any request is sent.
+- Results from the cause list tools carry `_meta.provenance.untrusted_content`; the tools are annotated read only and not idempotent (each call is charged); a court list page served from the session reports `creditsCharged` 0 and `servedFromSession`; a response body that stalls hits the deadline; a cancelled call also stops a 429 back-off wait; a cancelled call aborts the request to the API; oversized results are paged by rows or compacted with counts rather than cut silently.
+- Error guidance for `UPSTREAM_UNAVAILABLE`, `CAUSE_LISTS_NOT_ENABLED`, `MATTER_NOT_FOUND` and `COURT_LIST_NOT_FOUND`.
+- Two party profile tools: `build_party_profile` (`POST /party/profile`) and `get_party_profile`
+  (`GET /party/profile/{requestId}`), 45 tools in total. `mode` is required on `build_party_profile`, and its
+  description states the cost as the API documents it: every profile costs at least 100 credits, even when no case
+  is found; a quick profile never costs more than 304 credits; a full profile is charged as each stage finishes, up
+  to `maxCredits` (100 to 5000, default 1000). It sends a session scoped `Idempotency-Key` like
+  `screen_party_litigation`, so an identical retry replays without a new charge (and in full mode returns the same
+  `requestId`), and `fresh` forces a new request. Names are normalised to NFKC and control characters are refused;
+  a malformed `requestId`, `maxCredits` with quick mode, a repeated `include` value and an impossible date are
+  rejected before any request. Profiles are marked `_meta.provenance.untrusted_content`; an oversized profile is
+  compacted with counts and ids instead of being cut. The completion webhook is not exposed.
+- `DELETE /audit` is deliberately not a tool; it is available in the SDKs only (see the README).
+- New API 1.8.0 response fields are passed through: `bench`, `courtRecordActs`, `courtRecordFir`, `sameMatter`,
+  `withheld`, `unavailableReason`, `ordersTextWithheld` and `withheldReason` already reach the model inside `data`,
+  and tool descriptions now name them; top level fields other than `data`, `meta` and `pagination` (such as
+  `cnrLookup` on a CNR search) are no longer dropped.
+- Error guidance for `PARTY_PROFILE_FULL_UNAVAILABLE`, `PARTY_PROFILE_TOO_MANY_ACTIVE`,
+  `DISTINCT_NAMES_LIMIT_REACHED`, `PARTY_SCREEN_SEARCH_DEGRADED`, `ACCOUNT_STANDING_UNAVAILABLE`,
+  `ENTITLEMENT_UNAVAILABLE`, `API_NOT_AVAILABLE_ON_TRIAL`, `API_ENTERPRISE_ONLY`, `IDEMPOTENCY_IN_PROGRESS` and
+  `IDEMPOTENCY_KEY_REUSED`. A 429 now shows its `code`, as the 403 and 404 results already did.
+
 ## 0.5.0
 
 ### Added
@@ -33,7 +77,7 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 - Single record lookups by id (`get_case`, `get_case_analysis`, `find_related_cases`,
   `get_case_pdf_url`) now time out after 30 seconds (`COURTMESH_LOOKUP_TIMEOUT_MS`) instead of 120,
   so an unknown id no longer leaves the chat apparently frozen for two minutes. The underlying
-  API now answers 404 for an unknown id (research change, same release train).
+  API now answers 404 for an unknown id.
 
 ## 0.4.2
 
@@ -76,11 +120,9 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
   reference artifact for keeping `test/e2e/mock-api.mjs` in sync with the
   real API shape; it is not loaded by the test suite, so the e2e suite
   passes unchanged (77 tests).
-- `test/e2e/dump-openapi.mjs` no longer hardcodes one contributor's absolute
-  laptop path to the research repo's `openapi.ts` (this is a public repo).
-  Both the source module path and the output path are now optional CLI
-  arguments, defaulting to the standard sibling checkout layout and to
-  `test/e2e/openapi.json` respectively.
+- `test/e2e/dump-openapi.mjs` takes the source module path and the
+  output path as CLI arguments, the output defaulting to
+  `test/e2e/openapi.json`.
 - README's hosted HTTP mode section no longer hedges
   `https://mcp.courtmesh.ai` as "once this server is deployed": it is live,
   and the section now shows both the `Authorization: Bearer` header form
@@ -100,15 +142,14 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 
 ## 0.4.1
 
-Three fixes from a live authenticated QA pass against the hosted server
-(`QA_LIVE_MCP_AUTH_2026-09-19.md`), all in the shared client/tool plumbing
-rather than any single endpoint.
+Three fixes, all in the shared client/tool plumbing rather than any single
+endpoint.
 
 ### Fixed
 
 - `client.ts`'s `describeGenericError` (the 500/502/503/408 error path) used
   to surface only `body.error`, dropping `body.code` and `body.message` even
-  when the API sent them - unlike `describeForbiddenError` and
+  when the API sent them; unlike `describeForbiddenError` and
   `describeNotFoundError`, which already surfaced `code`. A `get_court_coverage`
   503 with `code: "COVERAGE_NOT_READY"` now reads `CourtMesh API returned
   status 503. Code: COVERAGE_NOT_READY. Error: ...`, and any other 5xx/408
@@ -122,7 +163,7 @@ rather than any single endpoint.
   credits charged.`, before this the only (undocumented) tell was
   `screen_party_litigation`'s `query.name`/`query.aliases` coming back as
   redaction placeholders instead of their literal values.
-- `search_indian_court_cases`: the live `/search/cases` index returns
+- `search_indian_court_cases`: the live `/search/cases` response returns
   `mongoId` on each hit, not `id`, even though every other tool here
   (`get_case`, `find_related_cases`, `get_case_pdf_url`, and especially
   `request_case_timeline`) documents passing in "the id field from search
@@ -131,16 +172,15 @@ rather than any single endpoint.
   alongside it, and a hit that already has its own `id` is untouched, so this
   keeps working once the server starts adding `id` itself.
 - `test/e2e/mock-api.mjs`: `scenario503Body` now carries `code:
-  "COVERAGE_NOT_READY"` (matching the real API body confirmed via raw REST in
-  the QA report), `/search/cases` hits now carry `mongoId` instead of `id`
-  (matching the real index), and a new `Idempotency-Key` replay simulation
+  "COVERAGE_NOT_READY"` (matching the real API body), `/search/cases` hits now carry `mongoId` instead of `id`
+  (matching the real response), and a new `Idempotency-Key` replay simulation
   (an in-memory `idempotencyStore` plus a `captureResponse` helper) replays
   the first stored 2xx response with `Idempotency-Replayed: true` for a
   repeated key, so the replay path is actually exercised end to end.
 
 ## 0.4.0
 
-Adds 4 new tools (18 total) for the research server's account-introspection,
+Adds 4 new tools (18 total) for the API's account-introspection,
 public reference and party-screen-batch endpoints, plus the `Idempotency-Key`
 contract being rolled out across the job/charge-triggering POST endpoints.
 
@@ -180,19 +220,18 @@ contract being rolled out across the job/charge-triggering POST endpoints.
 
 ## 0.3.0
 
-Aligned the server with the current CourtMesh public API contract (`api-v1-validations.ts`,
-`api-v1-prod.ts`, `party-screen-service.ts`, `api-tiers.ts`, `rate-limiter.ts`) and closed several
+Aligned the server with the current CourtMesh public API contract and closed several
 stale or incomplete tool descriptions.
 
 ### Added
 
 - `search_indian_court_cases`: new `cursor` input, the opaque signed pagination cursor. Documented
-  it as the current mechanism, with the raw `searchAfter` array kept only for callers on a server
-  with the self serve API tiers feature off. `limit` now documents the Free tier's 20 result page
+  it as the current mechanism, with the raw `searchAfter` array kept as a legacy
+  option. `limit` now documents the Free tier's 20 result page
   size cap and the `PAGE_LIMIT_EXCEEDED` / `PAGINATION_DEPTH_EXCEEDED` 400 codes.
 - `semantic_search_cases`: exposed the real top level filters the API accepts (`court`, `year`,
   `caseType`, `judgeName` and its aliases `judges`/`judge` as a single value, `caseNumber` as
-  digits only, `fromDate`, `toDate`), mapped onto the vector store's filter keys and echoed back in
+  digits only, `fromDate`, `toDate`), mapped onto the AI search's filter keys and echoed back in
   `meta.appliedFilters`, alongside the existing nested `filters` object.
 - `request_case_timeline`: new `refresh` boolean input. Default false is a stored read (1 credit,
   `meta.liveFetch: false`); `refresh: true` forces a live court fetch (20 credits, PAYG tier or
@@ -226,7 +265,7 @@ stale or incomplete tool descriptions.
   when `adjudicationsRun > 0`. Also notes the Free tier has no `semantic_search_cases` access
   (403 `SEMANTIC_NOT_ALLOWED`) and no live timeline fetches.
 - `client.ts`: `LONG_TIMEOUT_MS` default raised from 600s to 630s, so the client's own timeout does
-  not race the server's slowest documented internal deadline. Fixed `CURSOR_INVALID` (a 400 body
+  not race the server's. Fixed `CURSOR_INVALID` (a 400 body
   with no `error` field) being misreported as the unrelated tier page size cap shape.
 
 ### Removed

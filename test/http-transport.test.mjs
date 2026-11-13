@@ -2,10 +2,9 @@
  * Tests for the Streamable HTTP transport's admission control.
  *
  * These exist because the HTTP transport is the only part of this package that
- * is reachable by strangers. It used to allocate a session, worth roughly
- * 220 KB of RSS, for any anonymous POST that looked like an initialize, and
- * release it only when the client sent an explicit DELETE. A few thousand
- * unauthenticated requests were therefore enough to exhaust the box.
+ * is reachable by strangers. A session holds real memory, so it must not be
+ * allocated for an anonymous POST that merely looks like an initialize, or be
+ * released only on an explicit DELETE.
  *
  * Everything here runs against a real listening process over real HTTP. No
  * mocks, and no network beyond loopback: the upstream CourtMesh API is never

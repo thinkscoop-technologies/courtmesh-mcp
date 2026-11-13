@@ -1,9 +1,8 @@
 /**
  * End to end tests for the CourtMesh MCP server, driven through the real
  * @modelcontextprotocol/sdk Client over both transports (stdio and Streamable HTTP),
- * against a mock CourtMesh API (test/e2e/mock-api.mjs) built from the OpenAPI spec at
- * ../../../research/server/public-api/openapi.ts (dumped by dump-openapi.mjs into
- * test/e2e/openapi.json).
+ * against a mock CourtMesh API (test/e2e/mock-api.mjs) built from
+ * the public OpenAPI spec (dump-openapi.mjs writes a local, untracked copy).
  *
  * The real CourtMesh API is not reachable from here, so nothing in this file ever
  * calls it: every HTTP request the MCP server makes lands on the mock, on loopback.
@@ -55,6 +54,26 @@ const EXPECTED_TOOLS = [
   "remove_case_from_watchlist",
   "list_watchlist_cases",
   "get_case_changes",
+  "search_acts",
+  "resolve_act",
+  "get_act",
+  "get_act_history",
+  "list_act_sections",
+  "get_section",
+  "search_sections",
+  "lookup_section",
+  "list_section_citing_cases",
+  "list_cause_listings",
+  "list_matter_cause_listings",
+  "get_court_cause_list",
+  "check_cause_list_for_cnrs",
+  "list_case_orders",
+  "get_order_text",
+  "refresh_case_by_cnr",
+  "get_case_refresh_state",
+  "refresh_cases_batch",
+  "build_party_profile",
+  "get_party_profile",
 ];
 
 // ---------------------------------------------------------------------------
@@ -191,9 +210,9 @@ function lastRequestMatching(pathPattern: RegExp, method?: string) {
 // 1. Handshake, tools/list, schema shape
 // ---------------------------------------------------------------------------
 
-test("stdio: initialize handshake exposes exactly 25 tools with the documented names", async () => {
+test("stdio: initialize handshake exposes exactly 45 tools with the documented names", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 25, `expected 25 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
+  assert.equal(tools.length, 45, `expected 45 tools, got ${tools.length}: ${tools.map((t) => t.name).join(", ")}`);
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
 });
@@ -525,6 +544,43 @@ test("stdio: analyze_consolidated_case, request_case_timeline, screen_party_liti
   assert.ok(lastRequestMatching(/^\/party\/screen\/batch$/, "POST")?.headers?.["idempotency-key"]);
 });
 
+test("stdio: build_party_profile quick mode sends the mode and an Idempotency-Key and marks the profile untrusted", async () => {
+  const args = { name: "Ravi Examplekar", entityType: "person", purpose: "due_diligence", mode: "quick", knownPersons: ["Mohan Examplekar"] };
+  const result = await stdioMain.client.callTool({ name: "build_party_profile", arguments: args });
+  const req = lastRequestMatching(/^\/party\/profile$/, "POST");
+  assert.ok(req, "mock did not receive POST /party/profile");
+  assert.equal(req!.body.mode, "quick");
+  assert.equal(req!.body.purpose, "due_diligence");
+  const key = req!.headers?.["idempotency-key"];
+  assert.ok(key, "an Idempotency-Key is sent");
+  await stdioMain.client.callTool({ name: "build_party_profile", arguments: args });
+  assert.equal(lastRequestMatching(/^\/party\/profile$/, "POST")!.headers?.["idempotency-key"], key, "an identical retry sends the same key");
+  assert.notEqual((result as any).isError, true);
+  assert.equal((result as any)._meta?.provenance?.untrusted_content, true);
+  const text = resultText(result);
+  assert.ok(text.includes("Example Bench"), "bench is passed through");
+  assert.ok(text.includes("courtRecordActs"), "courtRecordActs is passed through");
+});
+
+test("stdio: build_party_profile full mode returns a requestId that get_party_profile reads", async () => {
+  const started = await stdioMain.client.callTool({
+    name: "build_party_profile",
+    arguments: { name: "Acme Example Private Limited", entityType: "company", purpose: "due_diligence", mode: "full", maxCredits: 200 },
+  });
+  assert.equal(lastRequestMatching(/^\/party\/profile$/, "POST")!.body.maxCredits, 200);
+  const startedText = resultText(started);
+  assert.match(startedText, /Nothing has been charged yet/);
+  const requestId = "ppr_" + "0123456789abcdef".repeat(2);
+  assert.ok(startedText.includes(requestId));
+  const status = await stdioMain.client.callTool({ name: "get_party_profile", arguments: { requestId } });
+  assert.ok(lastRequestMatching(new RegExp(`^/party/profile/${requestId}$`), "GET"), "mock did not receive GET /party/profile/{requestId}");
+  assert.notEqual((status as any).isError, true);
+  assert.match(resultText(status), /Still running/);
+  const missing = await stdioMain.client.callTool({ name: "get_party_profile", arguments: { requestId: "ppr_" + "f".repeat(32) } });
+  assert.equal((missing as any).isError, true);
+  assert.match(resultText(missing), /404/);
+});
+
 test("stdio: search_indian_court_cases (a non idempotency-key endpoint) sends no Idempotency-Key header", async () => {
   await stdioMain.client.callTool({ name: "search_indian_court_cases", arguments: { query: "privacy" } });
   const req = lastRequestMatching(/^\/search\/cases$/, "POST");
@@ -567,7 +623,7 @@ test("stdio: two separate sessions never share an Idempotency-Key for identical 
 });
 
 // ---------------------------------------------------------------------------
-// Idempotency-Key REPLAY: QA_LIVE_MCP_AUTH_2026-09-19.md finding 3. The server marks a replayed
+// Idempotency-Key REPLAY. The server marks a replayed
 // response with an `Idempotency-Replayed: true` header (simulated by the mock's idempotency
 // store); client.ts must turn that into a `replayed: true` field on the parsed body, and the five
 // idempotency-key tools must turn that into a leading "Replayed: ..." line in the tool result
@@ -613,7 +669,7 @@ test("stdio: get_court_coverage requires no API key and returns corpus totals", 
   const req = lastRequestMatching(/^\/coverage$/, "GET");
   assert.ok(req);
   const text = resultText(result);
-  assert.ok(text.includes("documentBearing"));
+  assert.ok(text.includes("byCourtType"));
   assert.ok(text.includes("total"));
   assert.notEqual((result as any).isError, true);
 });
@@ -624,7 +680,7 @@ test("stdio: get_court_coverage still succeeds with no API key configured at all
     const result = await noKeyClient.client.callTool({ name: "get_court_coverage", arguments: {} });
     assert.notEqual((result as any).isError, true, "coverage must not require a key, per the API spec");
     const text = resultText(result);
-    assert.ok(text.includes("documentBearing"));
+    assert.ok(text.includes("byCourtType"));
   } finally {
     await noKeyClient.close();
   }
@@ -640,7 +696,7 @@ test("stdio: check_api_health reports the upstream API status", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2b. New api-v1-validations.ts / api-tiers.ts contract fields: cursor, refresh,
+// 2b. New API contract fields: cursor, refresh,
 //     allowRemoteFetch, and the semantic search top level filters.
 // ---------------------------------------------------------------------------
 
@@ -668,8 +724,8 @@ test("stdio: search_indian_court_cases forwards a supplied cursor verbatim", asy
   assert.notEqual((result as any).isError, true);
 });
 
-test("stdio: search_indian_court_cases backfills id from mongoId when the index hit has no id field", async () => {
-  // QA_LIVE_MCP_AUTH_2026-09-19.md finding 2: the real /search/cases index returns mongoId, not
+test("stdio: search_indian_court_cases backfills id from mongoId when the search hit has no id field", async () => {
+  // The real /search/cases response returns mongoId, not
   // id, even though get_case/find_related_cases/get_case_pdf_url/request_case_timeline all
   // document "the id field from search results". The mock's hits (see scenario in mock-api.mjs)
   // deliberately carry only mongoId, matching the real API; backfillSearchHitIds in tools.ts must
@@ -900,7 +956,7 @@ test("stdio: an unknown tool name comes back as a clear tool error, not a crash"
 
 test("stdio: the server process survives invalid arguments and keeps answering", async () => {
   const { tools } = await stdioMain.client.listTools();
-  assert.equal(tools.length, 25, "server must still respond normally after a rejected call");
+  assert.equal(tools.length, 45, "server must still respond normally after a rejected call");
 });
 
 // ---------------------------------------------------------------------------
@@ -929,7 +985,7 @@ test("stdio: an unrecognised (well formed) API key produces a clear 401, not a c
     assert.match(text, /401|Authentication failed/i);
     // Process must still be alive and answering.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 45);
   } finally {
     await handle.close();
   }
@@ -952,7 +1008,7 @@ test("stdio: insufficient credits (402) on screen_party_litigation surfaces the 
     assert.match(text, /Shortfall:\s*58/);
     assert.match(text, /Top up at:.*api-keys#credits/);
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25, "process must survive a 402");
+    assert.equal(tools.length, 45, "process must survive a 402");
   } finally {
     await handle.close();
   }
@@ -1191,7 +1247,7 @@ test("stdio: 503 is reported as a plain upstream failure, with its machine reada
     const text = resultText(result);
     assertNonLeaking(text, [mock.KEYS.scenario503]);
     assert.match(text, /503/);
-    // QA_LIVE_MCP_AUTH_2026-09-19.md finding 4: describeGenericError used to drop body.code for
+    // describeGenericError used to drop body.code for
     // every 5xx/408 status, unlike the 400/403/404 describers. get_court_coverage's real 503 body
     // carries code: "COVERAGE_NOT_READY" (see scenario503Body in mock-api.mjs); the tool text must
     // surface it the same way describeForbiddenError/describeNotFoundError already do.
@@ -1230,7 +1286,7 @@ test("stdio: a hanging upstream aborts within the client's own timeout instead o
     assert.match(text, /timed out/i);
     // Process must still be alive and answering after an abort.
     const { tools } = await handle.client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 45);
   } finally {
     await handle.close();
   }
@@ -1265,11 +1321,11 @@ test("http: an unauthenticated /mcp request is refused with the documented 401",
   assert.doesNotMatch(JSON.stringify(body), /node_modules|\/Users\//);
 });
 
-test("http: Authorization: Bearer with a valid key connects and lists 25 tools", async () => {
+test("http: Authorization: Bearer with a valid key connects and lists 45 tools", async () => {
   const client = await connectHttpClient(httpMain.baseUrl, { bearer: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 45);
   } finally {
     await client.close();
   }
@@ -1279,7 +1335,7 @@ test("http: ?token= query parameter is honoured as an alternative to the header"
   const client = await connectHttpClient(httpMain.baseUrl, { queryToken: mock.KEYS.valid });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 25);
+    assert.equal(tools.length, 45);
     const result = await client.callTool({ name: "get_court_coverage", arguments: {} });
     assert.notEqual((result as any).isError, true);
   } finally {
