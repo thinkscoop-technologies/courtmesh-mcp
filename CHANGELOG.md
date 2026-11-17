@@ -2,7 +2,7 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
-## Unreleased
+## 0.7.0
 
 ### Added
 
