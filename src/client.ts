@@ -251,6 +251,16 @@ function describeForbiddenError(body: any): string {
 
 function describePaymentRequiredError(body: any): string {
   const apiError: string | undefined = typeof body?.error === "string" ? body.error : undefined;
+  // A per key credit limit is not a balance problem: buying credits does not lift it, so the
+  // generic "buy a credit pack" advice below would send the user the wrong way.
+  if (body?.code === "API_KEY_CREDIT_LIMIT_REACHED") {
+    const required = typeof body?.required === "number" ? ` This call would cost ${body.required} credits.` : "";
+    return (
+      `API key credit limit reached (402): API_KEY_CREDIT_LIMIT_REACHED.${required} This API key has used the credit ` +
+      "limit its account owner set for it. Buying credits does not lift it: the account owner can raise the key's limit " +
+      "or reset its usage in API keys settings. Nothing was charged; repeating the call will be refused the same way. Tell the user."
+    );
+  }
   const parts: string[] = [`Insufficient credits (402).${apiError ? ` The API said: "${apiError}".` : ""}`];
   // The API's field is "required", not "requiredCredits": this used to read the wrong key and
   // always print "unknown" even when the API supplied the real number.

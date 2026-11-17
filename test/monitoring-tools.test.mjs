@@ -68,7 +68,7 @@ test('the seven monitoring tools are listed with substantive descriptions', asyn
   const api = await startApi(() => ok({}));
   const { client, close } = await connect(api.baseUrl);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 45);
+  assert.equal(tools.length, 46);
   for (const name of NEW_TOOLS) {
     const tool = tools.find((t) => t.name === name);
     assert.ok(tool, `${name} is registered`);

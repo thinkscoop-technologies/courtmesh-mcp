@@ -64,10 +64,10 @@ async function withApi(respond, fn) {
   }
 }
 
-test('the nine acts tools are listed with their cost, and the server exposes 45 tools', async () => {
+test('the nine acts tools are listed with their cost, and the server exposes 46 tools', async () => {
   await withApi(() => ok({}), async (client) => {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 45);
+    assert.equal(tools.length, 46);
     for (const name of ACTS_TOOLS) {
       const tool = tools.find((t) => t.name === name);
       assert.ok(tool, `${name} is registered`);

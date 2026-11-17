@@ -76,7 +76,7 @@ async function withApi(respond, fn, now) {
 test('the four cause list tools are listed, state their cost, and are annotated read only', async () => {
   await withApi(() => ok({}), async ({ client }) => {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 45);
+    assert.equal(tools.length, 46);
     for (const name of TOOLS) {
       const tool = tools.find((t) => t.name === name);
       assert.ok(tool, `${name} is registered`);
