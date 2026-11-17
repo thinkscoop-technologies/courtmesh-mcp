@@ -65,6 +65,7 @@ This server supports two transports, chosen at startup:
 | `screen_party_litigation_batch` | `POST /party/screen/batch` | Yes | Screens up to 25 names in one call, same check as `screen_party_litigation`; each item independently priced and independently able to fail. Not available on the Free tier, no adjudicate option. |
 | `build_party_profile` | `POST /party/profile` | At least 100 credits per profile | A litigation profile of one person or company: cases grouped into identities by shared evidence, with status, acts and FIR as the court record states them, documents and a summary. `mode` is required. `quick` answers at once and costs at least 100 and never more than 304 credits. `full` runs in the background, reads each case of the first identity again from its court and analyses it, and is charged as each stage finishes, up to `maxCredits` (100 to 5000, default 1000). Not available on the Free tier. |
 | `get_party_profile` | `GET /party/profile/{requestId}` | No | Where a full mode profile stands, with its credits so far, and the profile once it is complete. |
+| `list_cases_by_fir` | `GET /firs/{key}/cases` | 1 credit per page | Every case, in any court, that cites one FIR, from a `courtRecordFir[].firKey`. Needs purpose bgv, kyc or due_diligence. |
 | `lookup_case_by_cnr` | `GET /cases/by-cnr/{cnr}` | 1 credit when a record is returned | Finds one case from its 16 character CNR. `fetch: true` starts a live court fetch for a CNR not in our records yet: the starting call returns `pending` and is free, the call that returns the record is the 1 credit charge, and the fetch shares the daily live fetch cap. Call again with the same CNR to poll. If the court had nothing for the CNR in the last 24 hours it is not asked again and the call is a 404. |
 | `create_watchlist` | `POST /watchlists` | No | Creates a watchlist and optionally starts watching up to 100 CNRs. Daily monitoring is included in your plan, within the watched case cap. |
 | `list_watchlists` | `GET /watchlists` | No | Lists the account's watchlists. |
@@ -91,7 +92,7 @@ This server supports two transports, chosen at startup:
 | `get_court_cause_list` | `GET /cause-lists/court` | 1 credit when the list carries rows (`ok` or `partial`), free for the other statuses | The published list of one court on one date, for a court where you have an open matter. Rows are paged with `offset` and `limit`. |
 | `check_cause_list_for_cnrs` | `POST /cause-lists/check` | 1 credit per CNR with status `listed` or `no_entry_found`, free for the rest | Checks 1 to 100 CNRs you watch against stored cause lists for at most 7 days; the result gives the `from` and `to` that were looked at. Never contacts a court. `no_entry_found` does not prove a case is not listed. The call also needs at least 1 credit available when it starts. |
 
-45 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
+46 tools in total. Full input and output field details are in each tool's own description, visible to any connected MCP client through `tools/list`.
 
 ### Monitoring a set of cases
 

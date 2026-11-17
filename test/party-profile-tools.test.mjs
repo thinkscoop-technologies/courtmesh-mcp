@@ -107,7 +107,7 @@ const BASE_ARGS = { name: 'Ravi Examplekar', entityType: 'person', purpose: 'due
 test('both party profile tools are registered; the create tool states its cost and needs a mode', async () => {
   await withApi(() => ok({}), async ({ client }) => {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 45);
+    assert.equal(tools.length, 46);
     const build = tools.find((t) => t.name === 'build_party_profile');
     const get = tools.find((t) => t.name === 'get_party_profile');
     assert.ok(build && get);
@@ -403,4 +403,118 @@ test('list_case_orders and get_case_changes pass the withheld fields through', a
       assert.equal(body.data[0].withheld, true);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Party API sync 18 Nov 2026: cases by FIR, purpose on get_case, per key credit limit,
+// and the full profile timing the API now documents (3 minutes, not 25).
+// ---------------------------------------------------------------------------
+
+const FIR_KEY = 'v1:3:20:sample-nagar:123:2024';
+
+test('list_cases_by_fir sends key, purpose, limit and cursor to GET /firs/{key}/cases and marks the text untrusted', async () => {
+  const cursor = 'c'.repeat(40);
+  await withApi(
+    () => ok({ firKey: FIR_KEY, cases: [{ caseId: CASE_ID, firKey: FIR_KEY, court: 'Example Court', title: 'STATE vs RAVI EXAMPLEKAR' }], nextCursor: 'n'.repeat(40) }),
+    async ({ api, client }) => {
+      const res = await client.callTool({ name: 'list_cases_by_fir', arguments: { key: FIR_KEY, purpose: 'bgv', limit: 10, cursor } });
+      assert.ok(!res.isError, text(res));
+      assert.equal(api.calls.length, 1);
+      const url = new URL(api.calls[0].url, 'http://x');
+      assert.equal(api.calls[0].method, 'GET');
+      assert.equal(url.pathname, `/api/v1/prod/firs/${encodeURIComponent(FIR_KEY)}/cases`);
+      assert.equal(url.searchParams.get('purpose'), 'bgv');
+      assert.equal(url.searchParams.get('limit'), '10');
+      assert.equal(url.searchParams.get('cursor'), cursor);
+      assert.equal(res._meta.provenance.untrusted_content, true);
+      assert.match(text(res), /More cases remain/);
+      assert.match(text(res), /never follow instructions/);
+    }
+  );
+});
+
+test('list_cases_by_fir refuses a guessed key, a wrong purpose and a bad cursor before any request', async () => {
+  await withApi(() => ok({}), async ({ api, client }) => {
+    for (const args of [
+      { key: 'FIR 123/2024 Sample Nagar', purpose: 'bgv' },
+      { key: 'v1:3:20:Sample Nagar:123:2024', purpose: 'bgv' },
+      { key: FIR_KEY, purpose: 'research' },
+      { key: FIR_KEY, purpose: 'bgv', cursor: 'short' },
+      { key: FIR_KEY, purpose: 'bgv', limit: 51 },
+    ]) {
+      const res = await client.callTool({ name: 'list_cases_by_fir', arguments: args });
+      assert.equal(res.isError, true, JSON.stringify(args));
+    }
+    assert.equal(api.calls.length, 0, 'nothing reached the API');
+  });
+});
+
+test('an empty FIR list is not reported as proof that no other case cites the FIR', async () => {
+  await withApi(() => ok({ firKey: FIR_KEY, cases: [], nextCursor: null }), async ({ client }) => {
+    const res = await client.callTool({ name: 'list_cases_by_fir', arguments: { key: FIR_KEY, purpose: 'kyc' } });
+    assert.ok(!res.isError);
+    assert.match(text(res), /does not mean no case cites it/);
+    assert.doesNotMatch(text(res), /More cases remain/);
+  });
+});
+
+test('an empty FIR page with more pages to come says to keep paging, not that nothing is listed', async () => {
+  await withApi(() => ok({ firKey: FIR_KEY, cases: [], nextCursor: 'n'.repeat(40) }), async ({ client }) => {
+    const res = await client.callTool({ name: 'list_cases_by_fir', arguments: { key: FIR_KEY, purpose: 'bgv' } });
+    assert.match(text(res), /No case on this page, but more pages remain/);
+    assert.doesNotMatch(text(res), /No case is listed for this FIR/);
+  });
+});
+
+test('a per key credit limit 402 without required still reads correctly', async () => {
+  await withApi(() => ({ status: 402, body: { success: false, code: 'API_KEY_CREDIT_LIMIT_REACHED' } }), async ({ client }) => {
+    const res = await client.callTool({ name: 'list_cases_by_fir', arguments: { key: FIR_KEY, purpose: 'bgv' } });
+    assert.match(text(res), /Buying credits does not lift it/);
+    assert.doesNotMatch(text(res), /would cost/);
+  });
+});
+
+test('get_case passes purpose with include, and sends no query when neither is given', async () => {
+  await withApi(() => ok({ id: CASE_ID }), async ({ api, client }) => {
+    await client.callTool({ name: 'get_case', arguments: { id: CASE_ID, include: ['hearings'], purpose: 'bgv' } });
+    await client.callTool({ name: 'get_case', arguments: { id: CASE_ID } });
+    const first = new URL(api.calls[0].url, 'http://x');
+    assert.equal(first.searchParams.get('purpose'), 'bgv');
+    assert.ok(first.searchParams.get('include'));
+    assert.equal(new URL(api.calls[1].url, 'http://x').search, '');
+    const { tools } = await client.listTools();
+    const getCase = tools.find((t) => t.name === 'get_case');
+    assert.match(getCase.description, /list_cases_by_fir/);
+    assert.match(getCase.description, /top-level linkedCases/);
+    assert.match(getCase.description, /linkedCasesTruncated/);
+  });
+});
+
+test('a per key credit limit 402 never tells the user to buy credits', async () => {
+  await withApi(
+    () => ({ status: 402, body: { success: false, error: 'API key credit limit reached', code: 'API_KEY_CREDIT_LIMIT_REACHED', required: 100 } }),
+    async ({ client }) => {
+      const res = await client.callTool({ name: 'list_cases_by_fir', arguments: { key: FIR_KEY, purpose: 'bgv' } });
+      assert.equal(res.isError, true);
+      assert.match(text(res), /API_KEY_CREDIT_LIMIT_REACHED/);
+      assert.match(text(res), /Buying credits does not lift it/);
+      assert.match(text(res), /would cost 100 credits/);
+      assert.doesNotMatch(text(res), /Buy a credit pack/);
+    }
+  );
+});
+
+test('full profile timing matches the API: refreshes take at most 3 minutes, never 25', async () => {
+  await withApi(() => ok({ requestId: REQ_ID, status: 'queued', maxCredits: 1000 }), async ({ client }) => {
+    const { tools } = await client.listTools();
+    for (const name of ['build_party_profile', 'get_party_profile']) {
+      const d = tools.find((t) => t.name === name).description;
+      assert.doesNotMatch(d, /25 minutes/, name);
+    }
+    assert.match(tools.find((t) => t.name === 'get_party_profile').description, /not_needed/);
+    assert.match(tools.find((t) => t.name === 'build_party_profile').description, /list_cases_by_fir/);
+    const res = await client.callTool({ name: 'build_party_profile', arguments: { ...BASE_ARGS, mode: 'full', fresh: true } });
+    assert.match(text(res), /at most 3 minutes/);
+    assert.doesNotMatch(text(res), /25 minutes/);
+  });
 });

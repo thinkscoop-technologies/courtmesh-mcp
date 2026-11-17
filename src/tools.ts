@@ -32,6 +32,7 @@ import {
   isIsoDate,
 } from "./cause-lists.js";
 import {
+  FIR_KEY_PATTERN,
   PROFILE_PROVENANCE_NOTE,
   PROFILE_REQUEST_ID_PATTERN,
   PROFILE_TRUSTED_META,
@@ -506,12 +507,29 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "bench (tribunals), courtRecordActs and courtRecordFir (acts and FIR as the court record states them). Fields like " +
         "detailedSummary, headnote, holding and keyFacts are NOT included here, call get_case_analysis " +
         "for those. Pass include to add hearing history and advocates at no extra charge. Either can come back " +
-        "null, which means we hold no such record for this case and does not mean the court lists none.",
-      inputSchema: { id: idParam, include: includeParam },
+        "null, which means we hold no such record for this case and does not mean the court lists none. " +
+        "For a background check pass purpose bgv, kyc or due_diligence: criminal cases then show the FIR (police " +
+        "station, FIR number, year, and firKey where the station could be matched across courts) in courtRecordFir, " +
+        "and a top-level linkedCases: other cases, in any court, that cite the same FIR, at most 25 " +
+        "(linkedCasesTruncated is true when there are more). Pass firKey to list_cases_by_fir for the full list. Matters withheld for privacy never show FIR details or links.",
+      inputSchema: {
+        id: idParam,
+        include: includeParam,
+        purpose: z
+          .enum(["kyc", "bgv", "due_diligence", "litigation", "research", "compliance"])
+          .optional()
+          .describe("Why the case is being read. bgv, kyc and due_diligence show FIR details on criminal cases and linkedCases."),
+      },
     },
     async (args): Promise<CallToolResult> => {
-      const { id, include } = args as any;
-      const result = await callApi(opts, { method: "GET", path: `cases/${encodeURIComponent(id)}`, query: includeQuery(include), timeoutMs: LOOKUP_TIMEOUT_MS });
+      const { id, include, purpose } = args as any;
+      const query = { ...(includeQuery(include) ?? {}), ...(purpose ? { purpose } : {}) };
+      const result = await callApi(opts, {
+        method: "GET",
+        path: `cases/${encodeURIComponent(id)}`,
+        query: Object.keys(query).length > 0 ? query : undefined,
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+      });
       if (!result.ok) return errorResult(result.message);
       return envelopeResult(result.data);
     }
@@ -2538,7 +2556,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "Builds a litigation profile of one person or company: what screen_party_litigation finds, grouped into " +
         "identities by shared evidence (a known person recorded as a relation, the same identifier), with each case's " +
         "court, bench (tribunals), case type, title, party role, status, next hearing date, decision date, confidence " +
-        "band, matchReasons, acts and FIR as the court record states them (courtRecordActs, courtRecordFir), other rows " +
+        "band, matchReasons, acts and FIR as the court record states them (courtRecordActs, courtRecordFir; pass a " +
+        "courtRecordFir[].firKey to list_cases_by_fir for every case of that FIR in other courts), other rows " +
         "of the same Supreme Court matter (sameMatter), the documents held with links, and a summary. " +
         PROFILE_COST +
         "mode is REQUIRED here so the cost is always a deliberate choice. mode quick: one answer, priced by what the " +
@@ -2546,7 +2565,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "100 cases; plus any AI review by its tokens), with a minimum of 100 credits; one call never costs more than " +
         "304 credits; meta.creditsCharged is what left the wallet and meta.creditsBreakdown itemises it. mode full: " +
         "answers at once with a requestId and runs in the background: it reads every case of the first identity again " +
-        "from its court, analyses each case and writes an analysis of the party. Nothing is charged when it is " +
+        "from its court (a case already disposed is final and is not read again), analyses each case and writes an " +
+        "analysis of the party. Nothing is charged when it is " +
         "accepted; each stage is charged as it finishes, up to maxCredits (100 to 5000; default 1000, or the balance if " +
         "that is lower). Read the outcome with get_party_profile. An account may have at most 3 full profiles queued " +
         "or running. Before calling, tell the user the mode and the most it may cost. " +
@@ -2692,7 +2712,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           replayNote.length > 0
             ? `This is the stored acceptance of the same request ${data.requestId}; it was not started a second time, and its status below may be out of date.`
             : `Accepted: full mode is running in the background as ${data.requestId}. Nothing has been charged yet; each stage is charged as it finishes, up to maxCredits (${data.maxCredits ?? "as sent"}).`,
-          `Call get_party_profile with requestId ${data.requestId} every few seconds to a minute. Most requests finish within minutes; waiting for the courts can take up to 25 minutes. Do not call build_party_profile again to check on it.`,
+          `Call get_party_profile with requestId ${data.requestId} every few seconds to a minute. Most requests finish within minutes; waiting for the courts, with retries, takes at most 3 minutes. Do not call build_party_profile again to check on it.`,
         ];
         return { ...envelopeResult(result.data, notes.join("\n")), _meta: PROFILE_TRUSTED_META };
       }
@@ -2723,9 +2743,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "FREE. Reads where a full mode request from build_party_profile stands, by its requestId (ppr_ followed by 32 " +
         "hex characters). status is queued, running (stage and progress say how far it is), completed (result holds the " +
         "profile in the same shape as a quick profile, with courtRefresh and analysis on every case of the first " +
-        "identity, partyAnalysis, and notes on anything not done) or failed (failure.code and failure.message say why). " +
+        "identity (courtRefresh.status not_needed means the case is disposed and was not read again, at no charge; analysis.status short or not_done says what each case got), partyAnalysis, and notes on anything left out, empty when nothing was) or failed (failure.code and failure.message say why). " +
         "credits.charged is what has left the wallet so far and credits.breakdown itemises it per stage. Poll every few " +
-        "seconds to a minute; waiting for the courts can take up to 25 minutes. A result can be read for 30 days; after " +
+        "seconds to a minute; waiting for the courts, with retries, takes at most 3 minutes, and most requests finish within minutes. A result can be read for 30 days; after " +
         "that resultExpired is true and only status, progress and credits remain. An id from another account is the " +
         "same 404 as an unknown one. Reading the status never starts or charges anything; build_party_profile again " +
         "would start a new charged request. The same reading rules as build_party_profile apply: an identity is not a " +
@@ -2784,6 +2804,73 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         notes
       );
       return out.isError ? out : { ...out, _meta: PROFILE_UNTRUSTED_META };
+    }
+  );
+
+  // 32. list_cases_by_fir -------------------------------------------------
+  // GET /firs/{key}/cases (API 1.8.0, 14 Nov 2026). Every case, in any court, that
+  // cites one FIR. The key format is checked here exactly as the server checks it,
+  // so a guessed or mangled key fails at once instead of costing a round trip.
+  server.registerTool(
+    "list_cases_by_fir",
+    {
+      title: "List Cases by FIR",
+      description:
+        "Lists every case, in any court, that arose from one FIR: the magistrate case, bail applications, the " +
+        "sessions case and High Court petitions. Costs 1 credit per page; no AI credits. Take key from " +
+        "courtRecordFir[].firKey on a case (get_case with purpose bgv, kyc or due_diligence) or on a party profile " +
+        "(build_party_profile, get_party_profile); never build or guess a key. purpose is REQUIRED and must be bgv, " +
+        "kyc or due_diligence. A case is listed only when its record may be shown for that purpose, so a case not " +
+        "listed may still exist: an empty or short list is NOT proof that no other case cites the FIR. Pages hold up " +
+        "to limit cases and fewer when some are withheld; follow nextCursor until it is null. Each distinct FIR key " +
+        "counts toward the daily limit of distinct cases. " +
+        PROFILE_PROVENANCE_NOTE,
+      inputSchema: {
+        key: z
+          .string()
+          .trim()
+          .max(160)
+          .regex(FIR_KEY_PATTERN, "key must be an FIR key exactly as returned in courtRecordFir[].firKey, for example v1:3:20:sample-nagar:123:2024.")
+          .describe("An FIR key exactly as returned in courtRecordFir[].firKey."),
+        purpose: z
+          .enum(["bgv", "kyc", "due_diligence"])
+          .describe("REQUIRED. Why the cases are being read: bgv, kyc or due_diligence."),
+        limit: z.number().int().min(1).max(50).optional().describe("Cases per page, 1 to 50, default 25."),
+        cursor: z
+          .string()
+          .trim()
+          .regex(/^[A-Za-z0-9_-]{30,512}$/, "cursor must be the nextCursor value of a previous page, passed back unmodified.")
+          .optional()
+          .describe("The nextCursor of the previous page, passed back unmodified."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async (args, extra): Promise<CallToolResult> => {
+      const { key, purpose, limit, cursor } = args as any;
+      const result = await callApi(opts, {
+        method: "GET",
+        path: `firs/${encodeURIComponent(key)}/cases`,
+        query: { purpose, limit, cursor },
+        timeoutMs: LOOKUP_TIMEOUT_MS,
+        signal: extra?.signal,
+      });
+      if (!result.ok) return errorResult(result.message);
+      const data = result.data?.data;
+      const notes: string[] = [];
+      const cases = Array.isArray(data?.cases) ? data.cases : [];
+      const more = typeof data?.nextCursor === "string" && data.nextCursor.length > 0;
+      if (cases.length === 0 && more) {
+        notes.push("No case on this page, but more pages remain: keep following nextCursor.");
+      } else if (cases.length === 0) {
+        notes.push(
+          "No case is listed for this FIR under this purpose. That does not mean no case cites it: cases whose record may not be shown for this purpose are left out."
+        );
+      }
+      if (more) {
+        notes.push(`More cases remain: call list_cases_by_fir again with the same key and purpose and cursor ${data.nextCursor}. A page can hold fewer than limit cases while more remain.`);
+      }
+      notes.push(PROFILE_PROVENANCE_NOTE);
+      return { ...envelopeResult(result.data, notes.join("\n")), _meta: PROFILE_UNTRUSTED_META };
     }
   );
 }

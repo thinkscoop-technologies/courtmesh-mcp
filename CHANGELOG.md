@@ -2,6 +2,26 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## Unreleased
+
+### Added
+
+- `list_cases_by_fir` (`GET /firs/{key}/cases`): every case, in any court, that cites one FIR, from a
+  `courtRecordFir[].firKey` on a case or a party profile. `purpose` is required (bgv, kyc or due_diligence);
+  1 credit per page. The key is checked against the API's own pattern before any request, so a guessed or
+  reformatted key fails at once. An empty list is reported as not proof that no other case cites the FIR.
+  46 tools in total.
+- `purpose` on `get_case`: bgv, kyc or due_diligence show FIR details on criminal cases and `linkedCases`.
+
+### Changed
+
+- A 402 `API_KEY_CREDIT_LIMIT_REACHED` (the key's own credit limit set by the account owner) is reported as
+  such. It used to read as "Insufficient credits, buy a credit pack", which does not lift a key's limit.
+- `build_party_profile` and `get_party_profile` describe full mode as the API now runs it: court refreshes,
+  with retries, take at most 3 minutes (was "up to 25 minutes"); a disposed case is not read again
+  (`courtRefresh.status: "not_needed"`, no charge); each case states what it got in `courtRefresh.status`
+  and `analysis.status`.
+
 ## 0.6.0
 
 ### Added

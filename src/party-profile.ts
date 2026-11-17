@@ -140,3 +140,6 @@ export function compactProfile(profile: unknown, level: number, keepCases = Infi
 export function primaryCaseCount(profile: unknown): number {
   return isObject(profile) && Array.isArray(profile.identities) ? caseList(profile.identities[0]).length : 0;
 }
+
+/** An FIR key as the API returns it in courtRecordFir[].firKey; the server checks the same pattern. */
+export const FIR_KEY_PATTERN = /^v1:\d{1,3}:\d{1,4}:[a-z0-9]+(?:-[a-z0-9]+)*:[A-Z0-9]{1,30}:\d{4}$/;
