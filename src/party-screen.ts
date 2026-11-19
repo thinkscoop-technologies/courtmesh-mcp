@@ -16,15 +16,21 @@ const isObject = (v: unknown): v is Obj => typeof v === "object" && v !== null &
 const MATCH_FIELDS = [
   "caseId",
   "cnr",
+  "caseNumber",
   "title",
   "court",
   "caseType",
   "partyRole",
   "status",
   "caseStatus",
+  "disposalNature",
+  "filingDate",
   "decisionDate",
+  "nextHearingDate",
   "casePageUrl",
   "identity",
+  "acts",
+  "sections",
   "courtRecordActs",
   "courtRecordFir",
 ] as const;
@@ -37,6 +43,17 @@ function compactMatch(m: unknown): unknown {
     if (v !== undefined && v !== null && v !== "") out[key] = v;
   }
   if (isObject(m.confidence) && typeof m.confidence.band === "string") out.band = m.confidence.band;
+  if (isObject(m.evidence)) {
+    // A match with no identity verdict (a company) keeps its evidence whole: an identifier match is
+    // its only proof. A person keeps the two small fields that say what matched.
+    if (!isObject(m.identity)) out.evidence = m.evidence;
+    else {
+      const ev: Obj = {};
+      if (Array.isArray(m.evidence.matchedFields)) ev.matchedFields = m.evidence.matchedFields;
+      if (typeof m.evidence.disambiguatorPresent === "boolean") ev.disambiguatorPresent = m.evidence.disambiguatorPresent;
+      if (Object.keys(ev).length > 0) out.evidence = ev;
+    }
+  }
   if (Array.isArray(m.sameMatter)) out.sameMatterCount = m.sameMatter.length;
   return out;
 }
@@ -63,6 +80,15 @@ export function compactBatch(batch: unknown): unknown {
 /** The error code a batch item carries when its search did not finish (never charged). */
 export const ITEM_SEARCH_UNFINISHED = "PARTY_SCREEN_ITEM_FAILED";
 
+/** The errorIds of the failed items worth sending again, in order. */
+export function failedItemErrorIds(batch: unknown): string[] {
+  if (!isObject(batch) || !Array.isArray(batch.results)) return [];
+  return failedItemPositions(batch).map((at) => {
+    const r = (batch.results as unknown[])[at];
+    return isObject(r) && isObject(r.error) && typeof r.error.errorId === "string" ? r.error.errorId : String(at);
+  });
+}
+
 /** Positions (in the results array) of items that failed and are worth sending again. */
 export function failedItemPositions(batch: unknown): number[] {
   if (!isObject(batch) || !Array.isArray(batch.results)) return [];
@@ -82,7 +108,8 @@ export function mergeBatchRerun(batch: Obj, positions: number[], rerun: unknown)
   const results = Array.isArray(batch.results) ? [...batch.results] : [];
   const fresh = isObject(rerun) && Array.isArray(rerun.results) ? rerun.results : [];
   positions.forEach((at, k) => {
-    const r = fresh[k];
+    // The rerun's own index is the item's place in the rerun request.
+    const r = fresh.find((x) => isObject(x) && x.index === k);
     const original = results[at];
     if (!isObject(r) || !isObject(original)) return;
     results[at] = { ...r, index: original.index, ...(original.clientRef !== undefined ? { clientRef: original.clientRef } : {}) };

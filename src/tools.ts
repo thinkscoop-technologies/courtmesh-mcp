@@ -42,7 +42,7 @@ import {
   normalizeName,
   primaryCaseCount,
 } from "./party-profile.js";
-import { compactBatch, compactScreen, failedItemPositions, mergeBatchRerun } from "./party-screen.js";
+import { compactBatch, compactScreen, failedItemErrorIds, failedItemPositions, mergeBatchRerun } from "./party-screen.js";
 
 export interface ToolServerOptions {
   baseUrl: string;
@@ -269,16 +269,18 @@ const PERSON_IDENTITY_GUIDE =
   "summary.byBand counts the name match strength (confirmed, probable, possible, unlikely), a separate scale: for a person, " +
   "read the identity verdict. summary.note appears when part of the search did not finish: say the result may be incomplete " +
   "and screen again. warnings flags a problem with the request itself, such as a company name sent as a person. " +
-  "Output: by default each match is compact (case, court, status, identity, acts, FIR, link); pass detail full for the " +
-  "scoring evidence. ";
+  "Output: by default each match is compact (case, court, status, disposal, dates, identity, acts and sections, FIR, " +
+  "link, and what matched); a company match keeps its full evidence. Pass detail full for every scoring signal. ";
 
 const detailParam = z
   .enum(["compact", "full"])
   .optional()
   .describe(
-    "compact (default): each match keeps caseId, cnr, title, court, caseType, partyRole, status, caseStatus, decisionDate, " +
-      "casePageUrl, band, identity, courtRecordActs and courtRecordFir; everything else in the response is unchanged. full: the " +
-      "API's response as is, including evidence signals and rationale per match. This flag is never sent to the CourtMesh API."
+    "compact (default): each match keeps caseId, cnr, caseNumber, title, court, caseType, partyRole, status, caseStatus, " +
+      "disposalNature, filingDate, decisionDate, nextHearingDate, casePageUrl, band, identity, acts, sections, courtRecordActs, " +
+      "courtRecordFir and evidence.matchedFields and disambiguatorPresent (a company match keeps all its evidence); " +
+      "everything else in the response is unchanged. full: the API's response as is, including every signal and the " +
+      "rationale per match. This flag is never sent to the CourtMesh API."
   );
 
 const freshParam = z
@@ -1174,9 +1176,9 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "as screen_party_litigation - always surface those per item rather than summarizing the whole batch as a " +
         "single clean or dirty result. " +
         PERSON_IDENTITY_GUIDE +
-        "An item whose search did not finish is run once more by the server; if it still fails it carries " +
-        "error.code PARTY_SCREEN_ITEM_FAILED and is not charged. Calling this tool again with the same batch then " +
-        "runs only those failed items again (charged as usual) and merges them into the result. " +
+        "An item whose search did not finish is run once more by the server when time allows; if it still fails it " +
+        "carries error.code PARTY_SCREEN_ITEM_FAILED and is not charged. Calling this tool again with the same batch " +
+        "in this session within 24 hours runs only those failed items again (charged as usual) and merges them in. " +
         "This call sends an Idempotency-Key derived from every argument here plus " +
         "this session, so retrying this exact same batch in this same session never re-charges credits; the " +
         "identical batch from a different session is never treated as a replay of this one, and changing any item " +
@@ -1284,11 +1286,20 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       // only those items are sent again, as their own request, and merged back (incident: a buyer's
       // background check test, 20 Nov 2026). The key carries the failures' own ids, so retrying the
       // rerun replays it, and a new failure gets a new key.
-      const failed = isReplayed(result.data) ? failedItemPositions(result.data?.data) : [];
-      if (failed.length > 0) {
+      // Each round sends the still-failed items again under a key made of their own failure ids, so a
+      // retry of a round replays it free, and a round that fails again gets a new key next time. A
+      // round that comes back as a replay with failures still in it is followed by one more, at most 3.
+      if (isReplayed(result.data) && failedItemPositions(result.data?.data).length > 0) {
         const rows: any[] = result.data.data.results;
-        const rerunItems = failed.map((at) => items[rows[at].index]).filter((it: unknown) => it !== undefined);
-        if (rerunItems.length === failed.length) {
+        let merged: any = result.data.data;
+        let charged = 0;
+        let ranFresh = false;
+        let problem: string | undefined;
+        for (let round = 0; round < 3; round++) {
+          const positions = failedItemPositions(merged);
+          if (positions.length === 0) break;
+          const rerunItems = positions.map((at) => items[rows[at]?.index]);
+          if (rerunItems.some((it: unknown) => it === undefined)) { problem = "the original items could not be matched"; break; }
           const rerunBody: Record<string, unknown> = { items: rerunItems, purpose };
           if (entityType !== undefined) rerunBody.entityType = entityType;
           const rerun = await callApi(opts, {
@@ -1298,22 +1309,21 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
             timeoutMs: LONG_TIMEOUT_MS,
             idempotencyKey: computeIdempotencyKey(
               "screen_party_litigation_batch:rerun",
-              { ...rerunBody, failures: failed.map((at) => rows[at]?.error?.errorId ?? at) },
+              { ...rerunBody, failures: failedItemErrorIds(merged) },
               opts.sessionSalt
             ),
           });
-          if (rerun.ok) {
-            notes.length = 0;
-            out = {
-              ...result.data,
-              data: mergeBatchRerun(result.data.data, failed, rerun.data?.data),
-              meta: { ...(result.data.meta ?? {}), creditsCharged: Number(rerun.data?.meta?.creditsCharged ?? 0) },
-            };
-            notes.push(`${failed.length} item(s) that had not finished were screened again now; meta.creditsCharged is what this rerun charged.`);
-          } else {
-            notes.push(`${failed.length} item(s) had not finished and could not be screened again just now: ${rerun.message}`);
-          }
+          if (!rerun.ok) { problem = rerun.message; break; }
+          merged = mergeBatchRerun(merged, positions, rerun.data?.data);
+          charged += Number(rerun.data?.meta?.creditsCharged ?? 0);
+          if (!isReplayed(rerun.data)) { ranFresh = true; break; }
         }
+        out = { ...result.data, data: merged, meta: { ...(result.data.meta ?? {}), creditsCharged: charged } };
+        const stillFailed = failedItemPositions(merged).length;
+        notes.length = 0;
+        if (ranFresh) notes.push(`Items that had not finished were screened again now; meta.creditsCharged is what that charged.${stillFailed ? ` ${stillFailed} still did not finish: call again to retry them.` : ""}`);
+        else notes.push(REPLAYED_NOTE);
+        if (problem) notes.push(`Items that had not finished could not be screened again just now: ${problem}`);
       }
       if (detail !== "full") out = { ...out, data: compactBatch(out?.data) };
       return envelopeResult(out, notes.length > 0 ? notes.join("\n") : undefined);

@@ -181,3 +181,36 @@ test('the tool descriptions explain addressCourts, excluded reasons and the iden
     assert.doesNotMatch(tools.map((t) => t.description).join(' '), /[–—]/, 'no em or en dashes');
   });
 });
+
+test('a rerun that comes back replayed and still failed gets one more round under a new key', async () => {
+  const keys = [];
+  await withApi(async (call) => {
+    keys.push(call.headers['idempotency-key']);
+    const replayed = { headers: { 'idempotency-replayed': 'true' } };
+    if (call.body.items.length === 2) {
+      return { ...ok({ results: [okItem(0, 'a'), failedItem(1, 'b', 'err-1')], summary: {} }, { meta: { creditsCharged: 0 } }), ...replayed };
+    }
+    if (keys.length === 2) {
+      // The first rerun is itself a replay of an earlier rerun that failed again.
+      return { ...ok({ results: [failedItem(0, 'b', 'err-2')], summary: {} }, { meta: { creditsCharged: 0 } }), ...replayed };
+    }
+    return ok({ results: [okItem(0, 'b')], summary: {} }, { meta: { creditsCharged: 100 } });
+  }, async ({ api, client }) => {
+    const res = await client.callTool({ name: 'screen_party_litigation_batch', arguments: { items: ITEMS, purpose: 'bgv', entityType: 'person' } });
+    const out = json(res);
+    assert.equal(api.calls.length, 3);
+    assert.notEqual(keys[2], keys[1], 'a new failure gets a new key');
+    assert.equal(out.data.results[1].ok, true);
+    assert.equal(out.data.results[1].clientRef, 'b');
+    assert.equal(out.meta.creditsCharged, 100);
+  });
+});
+
+test('a company match keeps its evidence in compact mode; a person keeps matchedFields only', async () => {
+  const company = match(1, { identity: undefined, evidence: { matchedFields: ['identifier'], signals: [{ name: 'identifier', status: 'matched' }] } });
+  await withApi(async () => ok(screen([company, match(2, { evidence: { matchedFields: ['title'], disambiguatorPresent: false, signals: [] } })])), async ({ client }) => {
+    const out = json(await client.callTool({ name: 'screen_party_litigation', arguments: ARGS }));
+    assert.deepEqual(out.data.matches[0].evidence.signals, [{ name: 'identifier', status: 'matched' }]);
+    assert.deepEqual(out.data.matches[1].evidence, { matchedFields: ['title'], disambiguatorPresent: false });
+  });
+});
