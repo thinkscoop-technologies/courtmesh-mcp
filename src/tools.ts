@@ -42,6 +42,7 @@ import {
   normalizeName,
   primaryCaseCount,
 } from "./party-profile.js";
+import { compactBatch, compactScreen, failedItemPositions, mergeBatchRerun } from "./party-screen.js";
 
 export interface ToolServerOptions {
   baseUrl: string;
@@ -247,6 +248,39 @@ export function computeIdempotencyKey(
 }
 
 /** Optional boolean schema shared by the five POST-backed tools' `fresh` argument. */
+/**
+ * How to read a person screen, written for the analyst who reads it (incident: a buyer's background
+ * check test, 20 Nov 2026). Shared by the single and the batch screen so both say the same thing.
+ */
+const PERSON_IDENTITY_GUIDE =
+  "HOW TO READ A PERSON SCREEN. Send fatherName, address.district and address.state whenever the user has them. " +
+  "Each match then carries identity.verdict: confirmed (the court record names the person, states that father, and the case " +
+  "is in that district and state; a High Court case, that state), likely (the father matches but the place does not settle it), " +
+  "or possible (name only, or a lesser read). identity.checks quote the court record for name, father, place and state, and " +
+  "identity.toConfirm says in plain words what would settle a verdict short of confirmed. A name check with extraMiddle means " +
+  "the record has another word in the middle of the name (often the father); when it is not the father sent, the case sorts " +
+  "lower and toConfirm says so. Cases the record shows belong to someone else (a different father after S/o or D/o, a sibling, " +
+  "the father's own case, a child of a person with that name) are NOT matches: they are listed in excluded, each with a plain " +
+  "reason; report them as excluded. toVerify lists district CNRs whose court case page could settle the verdict: refresh them " +
+  "with refresh_cases_batch and screen again. identityInputs says what is missing for a confirmed answer (the father, the " +
+  "district, or both): ask the user for it. addressCourts (sent only with address.district) says whether our records include " +
+  "the courts of that district: inRecords true, false (that district's courts could not be searched, so an empty screen reads " +
+  "inconclusive, never clear) or null (could not be checked). summary.byVerdict counts confirmed, likely and possible; " +
+  "summary.byBand counts the name match strength (confirmed, probable, possible, unlikely), a separate scale: for a person, " +
+  "read the identity verdict. summary.note appears when part of the search did not finish: say the result may be incomplete " +
+  "and screen again. warnings flags a problem with the request itself, such as a company name sent as a person. " +
+  "Output: by default each match is compact (case, court, status, identity, acts, FIR, link); pass detail full for the " +
+  "scoring evidence. ";
+
+const detailParam = z
+  .enum(["compact", "full"])
+  .optional()
+  .describe(
+    "compact (default): each match keeps caseId, cnr, title, court, caseType, partyRole, status, caseStatus, decisionDate, " +
+      "casePageUrl, band, identity, courtRecordActs and courtRecordFir; everything else in the response is unchanged. full: the " +
+      "API's response as is, including evidence signals and rationale per match. This flag is never sent to the CourtMesh API."
+  );
+
 const freshParam = z
   .boolean()
   .optional()
@@ -850,58 +884,24 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       title: "Screen Party Litigation",
       description:
         "Litigation check for one person or company name against the full case corpus: KYC, background " +
-        "verification, due diligence, counterparty and litigation screening. CONSUMES AI CREDITS: 100 credits if " +
-        "the screen finds any matches, 20 credits if it finds none, plus a further 80 credit surcharge if " +
-        "adjudicate is set true. purpose is REQUIRED and is not decorative: it is recorded under DPDP as the " +
-        "lawful basis for processing this name, so pick the value that actually describes why this screen is " +
-        "being run (kyc, bgv, due_diligence, litigation, research, compliance), never a placeholder. " +
-        "IMPORTANT ABOUT WHAT A MATCH MEANS: a match is a case record whose party text matches the given name and " +
-        "identifiers to some confidence band, it is NOT a verified statement that this specific real world person " +
-        "or company is a litigant. Common names, aliases and identical entity names across different individuals " +
-        "or companies all produce matches; always read confidence.band, evidence.matchedFields and " +
-        "evidence.disambiguatorPresent before treating a match as identity-confirmed, and prefer matches with an " +
-        "identifier (PAN, GSTIN, CIN, LLPIN) or address corroboration over name-only matches, especially for " +
-        "common person names. FOR A PERSON, ALWAYS SEND fatherName, address.district AND address.state when the user has them: " +
-        "every match then carries identity.verdict (confirmed, likely, possible) with identity.checks quoting the " +
-        "court record. confirmed means the court record names the person, states that father, and the case is in " +
-        "that district and state (a High Court case, that state). Cases the record shows belong to someone else (a different " +
-        "father, a sibling, the father's own case) have verdict not_this_person and are moved to excluded with the " +
-        "reason; report them as excluded, never as matches. identity.toConfirm says what would settle a lesser " +
-        "verdict. toVerify lists district CNRs whose court page could settle the verdict: refresh them with the " +
-        "case refresh tool and screen again. Without a father or a place no person identity can be confirmed, and " +
-        "identityInputs says so: ask the user for them. summary.verdict is one of matches_found, no_matches_found or inconclusive, and its " +
-        "rules are stricter than they look: no_matches_found is only ever returned when coverage.exhaustive is " +
-        "true (every available search strategy actually ran to completion) AND nothing was withheld; sending " +
-        "since always forces inconclusive too, because it is a best effort post filter that cannot certify " +
-        "completeness in either direction; and a withheld record (a restricted case, an unverifiable id, a masked " +
-        "title) with no other surviving match also forces inconclusive rather than a clean negative. Conversely, " +
-        "summary.matchCount (the size of the displayed matches array) can read 0 while verdict still reads " +
-        "matches_found, when every internally matching candidate was filtered out of the display by " +
-        "displayThreshold - verdict describes what was found, matchCount/matches describe what is shown at your " +
-        "threshold, and only the former should be treated as authoritative for \"was anything found\". Report an " +
-        "inconclusive or partial screen as exactly that, never as a clean record. The response's top level notice " +
-        "field (not coverage.note, which does not exist) carries the case removal / right-to-be-forgotten policy " +
-        "text; always surface it plus coverage.someRecordsWithheld to the end user rather than silently treating " +
-        "an inconclusive or partial screen as a clearance. adjudicate (default false) turns on an LLM " +
-        "disambiguation pass over the uncertain middle of the candidates for a more confident band; identifiers " +
-        "are never sent to the adjudication model. The +80 credit surcharge for adjudicate is charged only when " +
-        "adjudicationsRun is actually greater than 0 in the response - every candidate can already have been " +
-        "decisive (an exact identifier match, or too dissimilar to bother), in which case no model call happens " +
-        "and no surcharge is billed even though adjudicate was true. Free tier: 10 screens per month, and " +
-        "adjudicate:true is a HARD BLOCK there, not a silent ignore - it returns HTTP 403 API_TIER_NOT_ALLOWED " +
-        "before any screening runs at all, so do not set adjudicate true for a Free tier caller. The Free tier " +
-        "also has no semantic_search_cases access (403 SEMANTIC_NOT_ALLOWED) and no live court/timeline fetches " +
-        "(request_case_timeline's refresh:true needs PAYG or above), so a Free tier litigation check is keyword " +
-        "search plus deterministic party screening only. This is a records search, not a legal or compliance " +
-        "opinion; casePageUrl in each match links to the public case page. A match can also carry courtRecordActs, " +
-        "courtRecordFir and, for the Supreme Court, sameMatter (other rows of the same matter). This call sends an Idempotency-Key " +
-        "derived from every argument here plus this session, so retrying this exact same screen in this same " +
-        "session never re-charges credits; the identical screen from a different session is never treated as a " +
-        "replay of this one, and changing any argument (including name, aliases or identifiers) here also runs as " +
-        "a new, separately charged screen. When a replay happens, the result text starts with a \"Replayed: ...\" " +
-        "line so you can tell it apart from a freshly computed result (in addition to query.name/query.aliases " +
-        "coming back redacted, same as any stored record). Set fresh true to force a re-run, see the fresh " +
-        "argument. Use screen_party_litigation_batch instead to screen more than one name in a single call.",
+        "verification, due diligence, counterparty and litigation screening. " +
+        PERSON_IDENTITY_GUIDE +
+        "COST: 100 credits if the screen finds any matches (or excluded cases), 20 if it finds none, plus 80 when " +
+        "adjudicate is true and adjudicationsRun is above 0. purpose is REQUIRED and recorded under DPDP as the lawful " +
+        "basis for processing this name: pick the value that is true (kyc, bgv, due_diligence, litigation, research, " +
+        "compliance). WHAT A MATCH MEANS: a case record whose party text matches the name, NOT a verified statement that " +
+        "this real person or company is a litigant; common names produce many. For a company, prefer an identifier " +
+        "(PAN, GSTIN, CIN, LLPIN) match. VERDICT: summary.verdict is matches_found, no_matches_found or inconclusive. " +
+        "no_matches_found only when the search was exhaustive and nothing was withheld; since, a withheld record, or " +
+        "addressCourts.inRecords false with nothing found all give inconclusive. Report inconclusive as exactly that, never " +
+        "as a clean record, and always pass on the notice field and coverage.someRecordsWithheld. summary.matchCount is " +
+        "what is shown at displayThreshold; the verdict is what was found. adjudicate (default false) runs an AI review of " +
+        "the uncertain middle (identifiers are never sent to it); it is refused with 403 API_TIER_NOT_ALLOWED on the Free " +
+        "tier (10 screens a month). This is a records search, not a legal or compliance opinion; casePageUrl links to the " +
+        "public case page. REPLAYS: the call sends an Idempotency-Key from every argument plus this session, so the same " +
+        "screen again in this session within 24 hours replays the stored answer free (the text starts with \"Replayed:\" " +
+        "and query.name comes back redacted); fresh true forces a new, charged run. Use screen_party_litigation_batch for " +
+        "more than one name.",
       inputSchema: {
         name: z
           .string()
@@ -986,7 +986,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .min(1)
           .max(100, "limit cannot exceed 100")
           .optional()
-          .describe("Maximum number of matches to return, 1 to 100, default 40."),
+          .describe("How many candidate cases each search retrieves before scoring, 1 to 100, default 40. The matches returned can be more than this when several name forms are searched (aliases, the shorter forms courts write), and fewer when candidates score too low."),
         adjudicate: z
           .boolean()
           .optional()
@@ -1010,6 +1010,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
               "this can make matches empty (matchCount 0) even though summary.verdict still reads matches_found - " +
               "see the tool description. Omit to use the service default (0.6)."
           ),
+        detail: detailParam,
         fresh: freshParam,
       },
     },
@@ -1028,6 +1029,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         limit,
         adjudicate,
         displayThreshold,
+        detail,
         fresh,
       } = args as any;
       const body: Record<string, unknown> = { name, entityType, purpose };
@@ -1055,7 +1057,8 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         ),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
+      const shaped = detail === "full" ? result.data : { ...result.data, data: compactScreen(result.data?.data) };
+      return envelopeResult(shaped, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
     }
   );
 
@@ -1165,11 +1168,16 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "this batch is being run (kyc, bgv, due_diligence, litigation, research, compliance), never a placeholder. " +
         "IMPORTANT ABOUT WHAT A MATCH MEANS: exactly as in screen_party_litigation, a match is a case record whose " +
         "party text matches the given name and identifiers to some confidence band, not a verified statement " +
-        "about a specific real world person or company; read each item's confidence.band and evidence before " +
-        "treating a match as identity confirmed. Each item's own screen object has the same summary.verdict rules " +
+        "about a specific real world person or company; for a person read each match's identity.verdict before " +
+        "treating it as the candidate. Each item's own screen object has the same summary.verdict rules " +
         "(matches_found, no_matches_found, inconclusive) and the same notice/coverage.someRecordsWithheld fields " +
         "as screen_party_litigation - always surface those per item rather than summarizing the whole batch as a " +
-        "single clean or dirty result. This call sends an Idempotency-Key derived from every argument here plus " +
+        "single clean or dirty result. " +
+        PERSON_IDENTITY_GUIDE +
+        "An item whose search did not finish is run once more by the server; if it still fails it carries " +
+        "error.code PARTY_SCREEN_ITEM_FAILED and is not charged. Calling this tool again with the same batch then " +
+        "runs only those failed items again (charged as usual) and merges them into the result. " +
+        "This call sends an Idempotency-Key derived from every argument here plus " +
         "this session, so retrying this exact same batch in this same session never re-charges credits; the " +
         "identical batch from a different session is never treated as a replay of this one, and changing any item " +
         "here also runs as a new, separately charged batch. When a replay happens, the result text starts with a " +
@@ -1225,7 +1233,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
                 })
                 .optional(),
               knownPersons: z.array(z.string().trim().min(1)).max(10).optional(),
-              fatherName: z.string().trim().min(2).max(200).optional().describe("People only: the father's name."),
+              fatherName: z.string().trim().min(2).max(200).optional().describe("People only: the father's name. Matched as the father: with address.district and address.state it can confirm a case, and a record naming a different father after S/o or D/o is excluded. Send it whenever known."),
               court: z
                 .union([z.string().trim(), z.array(z.string().trim()).max(1, "one court per item for now")])
                 .optional(),
@@ -1247,11 +1255,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .enum(["person", "company"])
           .optional()
           .describe("Default entityType applied to any item above that does not specify its own."),
+        detail: detailParam,
         fresh: freshParam,
       },
     },
     async (args): Promise<CallToolResult> => {
-      const { items, purpose, entityType, fresh } = args as any;
+      const { items, purpose, entityType, detail, fresh } = args as any;
       const body: Record<string, unknown> = { items, purpose };
       if (entityType !== undefined) body.entityType = entityType;
 
@@ -1268,7 +1277,46 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         ),
       });
       if (!result.ok) return errorResult(result.message);
-      return envelopeResult(result.data, isReplayed(result.data) ? REPLAYED_NOTE : undefined);
+      let out: any = result.data;
+      const notes: string[] = [];
+      if (isReplayed(result.data)) notes.push(REPLAYED_NOTE);
+      // A retry of a batch whose items did not finish replays the failure from the server's cache, so
+      // only those items are sent again, as their own request, and merged back (incident: a buyer's
+      // background check test, 20 Nov 2026). The key carries the failures' own ids, so retrying the
+      // rerun replays it, and a new failure gets a new key.
+      const failed = isReplayed(result.data) ? failedItemPositions(result.data?.data) : [];
+      if (failed.length > 0) {
+        const rows: any[] = result.data.data.results;
+        const rerunItems = failed.map((at) => items[rows[at].index]).filter((it: unknown) => it !== undefined);
+        if (rerunItems.length === failed.length) {
+          const rerunBody: Record<string, unknown> = { items: rerunItems, purpose };
+          if (entityType !== undefined) rerunBody.entityType = entityType;
+          const rerun = await callApi(opts, {
+            method: "POST",
+            path: "party/screen/batch",
+            body: rerunBody,
+            timeoutMs: LONG_TIMEOUT_MS,
+            idempotencyKey: computeIdempotencyKey(
+              "screen_party_litigation_batch:rerun",
+              { ...rerunBody, failures: failed.map((at) => rows[at]?.error?.errorId ?? at) },
+              opts.sessionSalt
+            ),
+          });
+          if (rerun.ok) {
+            notes.length = 0;
+            out = {
+              ...result.data,
+              data: mergeBatchRerun(result.data.data, failed, rerun.data?.data),
+              meta: { ...(result.data.meta ?? {}), creditsCharged: Number(rerun.data?.meta?.creditsCharged ?? 0) },
+            };
+            notes.push(`${failed.length} item(s) that had not finished were screened again now; meta.creditsCharged is what this rerun charged.`);
+          } else {
+            notes.push(`${failed.length} item(s) had not finished and could not be screened again just now: ${rerun.message}`);
+          }
+        }
+      }
+      if (detail !== "full") out = { ...out, data: compactBatch(out?.data) };
+      return envelopeResult(out, notes.length > 0 ? notes.join("\n") : undefined);
     }
   );
 
@@ -2596,7 +2644,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "confidence band; it is not a verified statement about a real person or company. A person is never confirmed " +
         "on name alone. Read identities[].confidence and why, and report possibleOtherPeople as other possible people, " +
         "not as the subject. verdict no_confirmed_identity, or an empty identities list, is NOT a clean record: say that " +
-        "no identity reached the confidence asked for, and surface notes and the notice field. " +
+        "no identity reached the confidence asked for, and surface notes and the notice field. Each case carries the " +
+        "same identity verdict, checks and toConfirm as screen_party_litigation, excluded lists cases the record shows " +
+        "belong to someone else with a reason, and addressCourts (with address.district) says whether our records " +
+        "include the courts of that district (false: they could not be searched, so an empty answer is not clear). " +
         "Document links: links.text is a path for get_order_text (billed as usual); links.pdf is a download link valid " +
         "for one hour that needs no API key. Receiving a link is free; the first time it is opened it is charged as " +
         "one PDF call. Do not paste PDF links anywhere the user did not ask for them. " +
@@ -2654,7 +2705,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         minConfidence: z
           .enum(["possible", "probable", "confirmed"])
           .optional()
-          .describe("Lowest band for the primary identity and its listed cases. Default probable for a person, possible for a company."),
+          .describe("Lowest name match band for the primary identity and its listed cases: possible, probable or confirmed (the band scale, not the identity verdict; probable sits between possible and confirmed). Default probable for a person, possible for a company."),
         include: z
           .array(z.enum(["documents", "acts", "fir", "status", "summary"]))
           .min(1)

@@ -11,6 +11,17 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
   `identity.checks` quoting the court record. A case is confirmed when the court record names the person,
   states that father, and the case is in that district and state (a High Court case, that state). Cases the record shows
   belong to someone else are listed in `excluded`; `toVerify` lists district CNRs a court refresh could settle.
+- `detail` on `screen_party_litigation` and `screen_party_litigation_batch`: `compact` (default) keeps each match's
+  case, court, status, identity, acts, FIR and link and leaves out the per match scoring evidence; `full` returns the
+  API response unchanged.
+
+### Changed
+
+- The screen, batch and profile descriptions start with how to read a person screen: the identity verdicts,
+  `excluded` with its reason, `extraMiddle`, `toVerify`, `identityInputs`, `addressCourts`, `summary.note` and
+  `warnings`. `limit` is described as the number of candidates retrieved, not a cap on matches.
+- Calling `screen_party_litigation_batch` again after some items did not finish now sends only those items again
+  and merges them into the result, instead of replaying the failure.
 
 ## 0.7.0
 
