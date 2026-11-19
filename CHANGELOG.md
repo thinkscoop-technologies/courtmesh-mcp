@@ -2,6 +2,16 @@
 
 All notable changes to `@courtmesh/mcp-server` are documented here.
 
+## Unreleased
+
+### Added
+
+- `fatherName` and `address.district` on `screen_party_litigation`, `bulk_screen_party_litigation` items and
+  `build_party_profile`. For a person, every match carries `identity.verdict` (confirmed, likely, possible) with
+  `identity.checks` quoting the court record. A case is confirmed when the court record names the person,
+  states that father, and the case is in that district and state (a High Court case, that state). Cases the record shows
+  belong to someone else are listed in `excluded`; `toVerify` lists district CNRs a court refresh could settle.
+
 ## 0.7.0
 
 ### Added
