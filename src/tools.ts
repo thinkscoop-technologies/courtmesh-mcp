@@ -861,7 +861,15 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         "or companies all produce matches; always read confidence.band, evidence.matchedFields and " +
         "evidence.disambiguatorPresent before treating a match as identity-confirmed, and prefer matches with an " +
         "identifier (PAN, GSTIN, CIN, LLPIN) or address corroboration over name-only matches, especially for " +
-        "common person names. summary.verdict is one of matches_found, no_matches_found or inconclusive, and its " +
+        "common person names. FOR A PERSON, ALWAYS SEND fatherName, address.district AND address.state when the user has them: " +
+        "every match then carries identity.verdict (confirmed, likely, possible) with identity.checks quoting the " +
+        "court record. confirmed means the court record names the person, states that father, and the case is in " +
+        "that district and state (a High Court case, that state). Cases the record shows belong to someone else (a different " +
+        "father, a sibling, the father's own case) have verdict not_this_person and are moved to excluded with the " +
+        "reason; report them as excluded, never as matches. identity.toConfirm says what would settle a lesser " +
+        "verdict. toVerify lists district CNRs whose court page could settle the verdict: refresh them with the " +
+        "case refresh tool and screen again. Without a father or a place no person identity can be confirmed, and " +
+        "identityInputs says so: ask the user for them. summary.verdict is one of matches_found, no_matches_found or inconclusive, and its " +
         "rules are stricter than they look: no_matches_found is only ever returned when coverage.exhaustive is " +
         "true (every available search strategy actually ran to completion) AND nothing was withheld; sending " +
         "since always forces inconclusive too, because it is a best effort post filter that cannot certify " +
@@ -934,11 +942,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         address: z
           .object({
             city: z.string().trim().optional(),
+            district: z.string().trim().optional().describe("The address district, for example Bhavnagar. For a person, the place check of the identity."),
             state: z.string().trim().optional(),
             stateCode: z.string().trim().optional().describe("State code, for example MH, DL, KA."),
           })
           .optional()
-          .describe("Known address details, used as a disambiguating signal alongside name and identifiers."),
+          .describe("Known address details. For a person, send the district: with a court-stated father it confirms a case."),
         knownPersons: z
           .array(z.string().trim().min(1))
           .max(10, "knownPersons can hold at most 10 entries")
@@ -947,6 +956,13 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
             "Names of directors, partners, family members or known associates, used to help disambiguate between " +
               "same-named parties in different case records. Up to 10 entries."
           ),
+        fatherName: z
+          .string()
+          .trim()
+          .min(2)
+          .max(200)
+          .optional()
+          .describe("People only: the father's name. Matched as the father: a record naming a different father is excluded. Send it whenever known."),
         court: z
           .union([z.string().trim(), z.array(z.string().trim()).max(1, "one court per request for now")])
           .optional()
@@ -1006,6 +1022,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         identifiers,
         address,
         knownPersons,
+        fatherName,
         court,
         since,
         limit,
@@ -1018,6 +1035,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       if (identifiers !== undefined) body.identifiers = identifiers;
       if (address !== undefined) body.address = address;
       if (knownPersons !== undefined) body.knownPersons = knownPersons;
+      if (fatherName !== undefined) body.fatherName = fatherName;
       if (court !== undefined) body.court = court;
       if (since !== undefined) body.since = since;
       if (limit !== undefined) body.limit = limit;
@@ -1201,11 +1219,13 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
               address: z
                 .object({
                   city: z.string().trim().optional(),
+                  district: z.string().trim().optional(),
                   state: z.string().trim().optional(),
                   stateCode: z.string().trim().optional(),
                 })
                 .optional(),
               knownPersons: z.array(z.string().trim().min(1)).max(10).optional(),
+              fatherName: z.string().trim().min(2).max(200).optional().describe("People only: the father's name."),
               court: z
                 .union([z.string().trim(), z.array(z.string().trim()).max(1, "one court per item for now")])
                 .optional(),
@@ -2609,7 +2629,10 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
           .array(profileNameParam("A known person's name."))
           .max(10)
           .optional()
-          .describe("Up to 10 known persons: father or other relative, directors, partners. The strongest help for a person."),
+          .describe("Up to 10 known persons: other relatives, directors, partners. Put the father in fatherName instead."),
+        fatherName: profileNameParam("The father's name.")
+          .optional()
+          .describe("People only: the father's name, matched as the father. A case is confirmed only when the court record names the person, states that father, and the case is in address.district and address.state (a High Court case, that state). Send it whenever known."),
         identifiers: z
           .object({
             pan: z.string().trim().max(20).optional().describe("PAN."),
@@ -2622,11 +2645,12 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
         address: z
           .object({
             city: z.string().trim().min(1).max(100).optional(),
+            district: z.string().trim().min(1).max(100).optional().describe("The address district. For a person, the place check of the identity."),
             state: z.string().trim().min(1).max(100).optional(),
             stateCode: z.string().trim().min(1).max(10).optional().describe("State code, for example MH, DL, KA."),
           })
           .optional()
-          .describe("A weak signal: noted in why, never enough on its own to join a case to an identity."),
+          .describe("Where the person lives. For a person, send the district and the state: a case in that district and state (a High Court case, that state) whose court record names the person and states fatherName is confirmed. Alone, a weak signal."),
         minConfidence: z
           .enum(["possible", "probable", "confirmed"])
           .optional()
@@ -2667,6 +2691,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       const names: Array<[string, string]> = [["name", a.name]];
       (a.aliases ?? []).forEach((v: string, i: number) => names.push([`aliases.${i}`, v]));
       (a.knownPersons ?? []).forEach((v: string, i: number) => names.push([`knownPersons.${i}`, v]));
+      if (a.fatherName !== undefined) names.push(["fatherName", a.fatherName]);
       for (const [field, value] of names) {
         const problem = nameProblem(field, value);
         if (problem) problems.push(problem);
@@ -2690,6 +2715,7 @@ export function registerCourtMeshTools(server: McpServer, opts: ToolServerOption
       };
       if (a.aliases !== undefined) body.aliases = a.aliases.map(normalizeName);
       if (a.knownPersons !== undefined) body.knownPersons = a.knownPersons.map(normalizeName);
+      if (a.fatherName !== undefined) body.fatherName = normalizeName(a.fatherName);
       for (const key of ["maxCredits", "identifiers", "address", "minConfidence", "include", "allowUnconfirmedPrimary", "court", "since", "limit", "adjudicate"]) {
         if (a[key] !== undefined) body[key] = a[key];
       }

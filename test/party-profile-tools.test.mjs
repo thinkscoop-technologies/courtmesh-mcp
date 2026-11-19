@@ -162,6 +162,35 @@ test('build_party_profile sends the body and a deterministic Idempotency-Key, an
   );
 });
 
+test('identity_confirmation_father_district_2026_11_19: build_party_profile sends fatherName and address.district', async () => {
+  await withApi(
+    () => ok(quickProfile(), { meta: { creditsCharged: 100, metered: true, creditsBreakdown: {}, adjudicated: false, corpusAsOf: 'x' } }),
+    async ({ api, client }) => {
+      await client.callTool({ name: 'build_party_profile', arguments: { ...BASE_ARGS, fatherName: 'Mohan Examplekar', address: { district: 'Pune', state: 'Maharashtra' } } });
+      assert.equal(api.calls[0].body.fatherName, 'Mohan Examplekar');
+      assert.deepEqual(api.calls[0].body.address, { district: 'Pune', state: 'Maharashtra' });
+    },
+  );
+});
+
+test('identity_confirmation_father_district_2026_11_19: screen_party_litigation sends fatherName and district, and its description asks for both', async () => {
+  await withApi(
+    () => ok({ query: {}, summary: { matchCount: 0, byBand: {}, highestBand: null, verdict: 'no_matches_found' }, matches: [], relatedButUnverified: [], excluded: [], toVerify: [], coverage: {}, adjudicationsRun: 0, notice: '' }),
+    async ({ api, client }) => {
+      const { tools } = await client.listTools();
+      const screen = tools.find((t) => t.name === 'screen_party_litigation');
+      assert.ok(screen.inputSchema.properties.fatherName, 'fatherName is a screen argument');
+      assert.match(screen.description, /fatherName/);
+      assert.match(screen.description, /not_this_person|excluded/);
+      assert.doesNotMatch(screen.description, /[\u2013\u2014]/);
+      await client.callTool({ name: 'screen_party_litigation', arguments: { name: 'Ravi Examplekar', entityType: 'person', purpose: 'bgv', fatherName: 'Mohan Examplekar', address: { district: 'Pune' } } });
+      const call = api.calls.find((c) => c.url.includes('party/screen'));
+      assert.equal(call.body.fatherName, 'Mohan Examplekar');
+      assert.deepEqual(call.body.address, { district: 'Pune' });
+    },
+  );
+});
+
 test('build_party_profile: fresh true changes the key; a replay says it was not charged', async () => {
   await withApi(
     () => ok(quickProfile(), { meta: {} }),
