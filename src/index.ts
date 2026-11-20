@@ -24,9 +24,10 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { registerCourtMeshTools } from "./tools.js";
 import { apiKeyOverrideStorage } from "./context.js";
 import { DEFAULT_BASE_URL, isValidApiKeyFormat } from "./client.js";
+import { SERVER_VERSION } from "./version.js";
 
 const SERVER_NAME = "courtmesh-mcp";
-const SERVER_VERSION = "0.7.0";
+
 
 const baseUrl = process.env.COURTMESH_API_BASE_URL?.trim() || DEFAULT_BASE_URL;
 const apiKey = process.env.COURTMESH_API_KEY?.trim() || undefined;

@@ -5,7 +5,15 @@
  * gets consistent, LLM readable error messages instead of raw HTTP failures.
  */
 
+import { SERVER_VERSION } from "./version.js";
+
 export const DEFAULT_BASE_URL = "https://research.courtmesh.ai/api/v1/prod";
+
+/**
+ * Names this connector on every API call, so the account's access audit can show a call as made
+ * through the MCP connector. A display hint only; access is decided by the key alone.
+ */
+export const CLIENT_USER_AGENT = `courtmesh-mcp/${SERVER_VERSION}`;
 
 /** Reads a positive millisecond value from an env var, falling back when unset or invalid. */
 function envMs(name: string, fallback: number): number {
@@ -432,6 +440,7 @@ export async function request<T = any>(options: ClientOptions & RequestOptions):
   const attempt = async (): Promise<RawAttempt> => {
     const headers: Record<string, string> = {
       Accept: "application/json",
+      "User-Agent": CLIENT_USER_AGENT,
     };
     if (effectiveKey) {
       headers["X-API-Key"] = effectiveKey;
