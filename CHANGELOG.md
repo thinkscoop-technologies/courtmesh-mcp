@@ -6,6 +6,8 @@ All notable changes to `@courtmesh/mcp-server` are documented here.
 
 ### Added
 
+- Every API call sends `User-Agent: courtmesh-mcp/<version>`, so an account's access audit can show a call as
+  made through the MCP connector. It is a display hint only; access is decided by the key.
 - `fatherName` and `address.district` on `screen_party_litigation`, `bulk_screen_party_litigation` items and
   `build_party_profile`. For a person, every match carries `identity.verdict` (confirmed, likely, possible) with
   `identity.checks` quoting the court record. A case is confirmed when the court record names the person,
